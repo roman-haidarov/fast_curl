@@ -11,7 +11,8 @@ Gem::Specification.new do |spec|
   spec.summary       = "Ultra-fast parallel HTTP client as Ruby C extension on libcurl multi"
   spec.description   = "Parallel HTTP requests via libcurl curl_multi API. " \
                         "Releases GVL during I/O, compatible with Async gem and Fiber scheduler. " \
-                        "Supports execute (all), first_execute (first N), stream_execute (yield as ready)."
+                        "Supports execute (all), first_execute (first N), stream_execute (yield as ready). " \
+                        "Built-in retry functionality for network errors and custom HTTP status codes."
   spec.homepage      = "https://github.com/roman-haidarov/fast_curl"
   spec.license       = "MIT"
 

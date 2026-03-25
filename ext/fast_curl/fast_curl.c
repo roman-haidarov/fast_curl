@@ -11,11 +11,20 @@
 #define MAX_RESPONSE_SIZE     (100 * 1024 * 1024)
 #define MAX_REDIRECTS         5
 #define MAX_TIMEOUT           300
+#define MAX_RETRIES           10
+#define DEFAULT_RETRIES       1
+#define DEFAULT_RETRY_DELAY   0
 #define INITIAL_BUF_CAP       8192
 #define INITIAL_HEADER_CAP    16
 #define POLL_TIMEOUT_MS       50
 #define FIBER_POLL_TIMEOUT_MS 10
 #define HEADER_LINE_BUF_SIZE  512
+
+static const CURLcode DEFAULT_RETRYABLE_CURLE[] = {
+    CURLE_COULDNT_CONNECT, CURLE_OPERATION_TIMEDOUT, CURLE_SEND_ERROR,       CURLE_RECV_ERROR,
+    CURLE_GOT_NOTHING,     CURLE_PARTIAL_FILE,       CURLE_SSL_CONNECT_ERROR};
+#define DEFAULT_RETRYABLE_CURLE_COUNT \
+    (int)(sizeof(DEFAULT_RETRYABLE_CURLE) / sizeof(DEFAULT_RETRYABLE_CURLE[0]))
 
 static ID id_status;
 static ID id_headers;
@@ -27,6 +36,9 @@ static ID id_timeout;
 static ID id_connections;
 static ID id_count;
 static ID id_keys;
+static ID id_retries;
+static ID id_retry_delay;
+static ID id_retry_codes;
 static VALUE sym_status;
 static VALUE sym_headers;
 static VALUE sym_body;
@@ -36,6 +48,9 @@ static VALUE sym_method;
 static VALUE sym_timeout;
 static VALUE sym_connections;
 static VALUE sym_count;
+static VALUE sym_retries;
+static VALUE sym_retry_delay;
+static VALUE sym_retry_codes;
 
 typedef struct {
     char *data;
@@ -58,6 +73,10 @@ static inline void buffer_free(buffer_t *buf) {
     }
     buf->len = 0;
     buf->cap = 0;
+}
+
+static inline void buffer_reset(buffer_t *buf) {
+    buf->len = 0;
 }
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -114,6 +133,12 @@ static void header_list_free(header_list_t *h) {
     h->cap = 0;
 }
 
+static void header_list_reset(header_list_t *h) {
+    for (int i = 0; i < h->count; i++)
+        free(h->entries[i].str);
+    h->count = 0;
+}
+
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     header_list_t *h = (header_list_t *)userdata;
     size_t total = size * nmemb;
@@ -154,6 +179,8 @@ typedef struct {
     header_list_t headers;
     struct curl_slist *req_headers;
     int done;
+    CURLcode curl_result;
+    long http_status;
 } request_ctx_t;
 
 static inline void request_ctx_init(request_ctx_t *ctx, int index) {
@@ -163,6 +190,8 @@ static inline void request_ctx_init(request_ctx_t *ctx, int index) {
     header_list_init(&ctx->headers);
     ctx->req_headers = NULL;
     ctx->done = 0;
+    ctx->curl_result = CURLE_OK;
+    ctx->http_status = 0;
 }
 
 static void request_ctx_free(request_ctx_t *ctx) {
@@ -178,6 +207,26 @@ static void request_ctx_free(request_ctx_t *ctx) {
     }
 }
 
+static int request_ctx_reset_for_retry(request_ctx_t *ctx) {
+    if (ctx->easy) {
+        curl_easy_cleanup(ctx->easy);
+        ctx->easy = NULL;
+    }
+    buffer_reset(&ctx->body);
+    header_list_reset(&ctx->headers);
+    if (ctx->req_headers) {
+        curl_slist_free_all(ctx->req_headers);
+        ctx->req_headers = NULL;
+    }
+    ctx->easy = curl_easy_init();
+    if (!ctx->easy)
+        return 0;
+    ctx->done = 0;
+    ctx->curl_result = CURLE_OK;
+    ctx->http_status = 0;
+    return 1;
+}
+
 typedef struct {
     CURLM *multi;
     request_ctx_t *requests;
@@ -186,6 +235,13 @@ typedef struct {
     long timeout_ms;
     int max_connections;
 } multi_session_t;
+
+typedef struct {
+    int max_retries;
+    long retry_delay_ms;
+    int *retry_http_codes;
+    int retry_http_count;
+} retry_config_t;
 
 static VALUE build_response(request_ctx_t *ctx) {
     long status = 0;
@@ -318,8 +374,8 @@ static CURLcode setup_method_and_body(CURL *easy, VALUE method, VALUE body) {
     }
 
     if (!NIL_P(body)) {
-        CURL_SETOPT_CHECK(easy, CURLOPT_POSTFIELDS, StringValuePtr(body));
         CURL_SETOPT_CHECK(easy, CURLOPT_POSTFIELDSIZE, RSTRING_LEN(body));
+        CURL_SETOPT_CHECK(easy, CURLOPT_COPYPOSTFIELDS, StringValuePtr(body));
     }
 
     return CURLE_OK;
@@ -480,24 +536,25 @@ static int process_completed(multi_session_t *session, completion_ctx_t *cctx) {
         if (!ctx || ctx->done)
             continue;
         ctx->done = 1;
-
-        VALUE response;
+        ctx->curl_result = msg->data.result;
         if (msg->data.result == CURLE_OK) {
-            response = build_response(ctx);
-        } else {
-            response = build_error_response_with_code(curl_easy_strerror(msg->data.result),
-                                                      (int)msg->data.result);
+            curl_easy_getinfo(ctx->easy, CURLINFO_RESPONSE_CODE, &ctx->http_status);
         }
-
-        VALUE pair = rb_ary_new_from_args(2, INT2NUM(ctx->index), response);
 
         if (cctx->stream) {
+            VALUE response;
+            if (msg->data.result == CURLE_OK) {
+                response = build_response(ctx);
+            } else {
+                response = build_error_response_with_code(curl_easy_strerror(msg->data.result),
+                                                          (int)msg->data.result);
+            }
+            VALUE pair = rb_ary_new_from_args(2, INT2NUM(ctx->index), response);
             rb_yield(pair);
-        } else if (!NIL_P(cctx->results)) {
-            rb_ary_store(cctx->results, ctx->index, pair);
+            cctx->completed++;
+        } else {
+            cctx->completed++;
         }
-
-        cctx->completed++;
 
         if (cctx->target > 0 && cctx->completed >= cctx->target)
             return 1;
@@ -506,9 +563,102 @@ static int process_completed(multi_session_t *session, completion_ctx_t *cctx) {
     return 0;
 }
 
-static void parse_options(VALUE options, long *timeout, int *max_conn) {
+static void run_multi_loop(multi_session_t *session, completion_ctx_t *cctx) {
+    if (has_fiber_scheduler()) {
+        for (;;) {
+            CURLMcode mc = curl_multi_perform(session->multi, &session->still_running);
+            if (mc != CURLM_OK)
+                break;
+            if (process_completed(session, cctx))
+                break;
+            if (session->still_running == 0)
+                break;
+
+            int numfds = 0;
+            curl_multi_poll(session->multi, NULL, 0, FIBER_POLL_TIMEOUT_MS, &numfds);
+            rb_thread_schedule();
+        }
+        process_completed(session, cctx);
+    } else {
+        if (cctx->stream || cctx->target > 0) {
+            curl_multi_perform(session->multi, &session->still_running);
+            while (session->still_running > 0) {
+                rb_thread_call_without_gvl(poll_without_gvl, session, unblock_perform, session);
+                if (process_completed(session, cctx))
+                    break;
+            }
+            process_completed(session, cctx);
+        } else {
+            session->still_running = 1;
+            curl_multi_perform(session->multi, &session->still_running);
+            rb_thread_call_without_gvl(perform_without_gvl, session, unblock_perform, session);
+            process_completed(session, cctx);
+        }
+    }
+}
+
+static int is_default_retryable_curle(CURLcode code) {
+    for (int i = 0; i < DEFAULT_RETRYABLE_CURLE_COUNT; i++) {
+        if (DEFAULT_RETRYABLE_CURLE[i] == code)
+            return 1;
+    }
+    return 0;
+}
+
+static int should_retry(request_ctx_t *ctx, retry_config_t *retry_cfg) {
+    if (ctx->curl_result != CURLE_OK) {
+        return is_default_retryable_curle(ctx->curl_result);
+    }
+
+    if (retry_cfg->retry_http_count > 0) {
+        for (int i = 0; i < retry_cfg->retry_http_count; i++) {
+            if (retry_cfg->retry_http_codes[i] == (int)ctx->http_status)
+                return 1;
+        }
+    }
+
+    return 0;
+}
+
+typedef struct {
+    long delay_ms;
+} sleep_arg_t;
+
+static void *sleep_without_gvl(void *arg) {
+    sleep_arg_t *sa = (sleep_arg_t *)arg;
+    struct timespec ts;
+    ts.tv_sec = sa->delay_ms / 1000;
+    ts.tv_nsec = (sa->delay_ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+    return NULL;
+}
+
+static void retry_delay_sleep(long delay_ms) {
+    if (delay_ms <= 0)
+        return;
+
+    if (has_fiber_scheduler()) {
+        long remaining = delay_ms;
+        while (remaining > 0) {
+            long chunk = remaining > FIBER_POLL_TIMEOUT_MS ? FIBER_POLL_TIMEOUT_MS : remaining;
+            sleep_arg_t sa = {.delay_ms = chunk};
+            sleep_without_gvl(&sa);
+            rb_thread_schedule();
+            remaining -= chunk;
+        }
+    } else {
+        sleep_arg_t sa = {.delay_ms = delay_ms};
+        rb_thread_call_without_gvl(sleep_without_gvl, &sa, unblock_perform, NULL);
+    }
+}
+
+static void parse_options(VALUE options, long *timeout, int *max_conn, retry_config_t *retry_cfg) {
     *timeout = 30;
     *max_conn = 20;
+    retry_cfg->max_retries = DEFAULT_RETRIES;
+    retry_cfg->retry_delay_ms = DEFAULT_RETRY_DELAY;
+    retry_cfg->retry_http_codes = NULL;
+    retry_cfg->retry_http_count = 0;
 
     if (NIL_P(options) || !rb_obj_is_kind_of(options, rb_cHash))
         return;
@@ -532,6 +682,40 @@ static void parse_options(VALUE options, long *timeout, int *max_conn) {
             conn_val = 20;
         *max_conn = conn_val;
     }
+
+    VALUE r = rb_hash_aref(options, sym_retries);
+    if (!NIL_P(r)) {
+        int retries_val = NUM2INT(r);
+        if (retries_val < 0)
+            retries_val = 0;
+        if (retries_val > MAX_RETRIES)
+            retries_val = MAX_RETRIES;
+        retry_cfg->max_retries = retries_val;
+    }
+
+    VALUE rd = rb_hash_aref(options, sym_retry_delay);
+    if (!NIL_P(rd)) {
+        long delay_val = NUM2LONG(rd);
+        if (delay_val < 0)
+            delay_val = 0;
+        if (delay_val > 30000)
+            delay_val = 30000;
+        retry_cfg->retry_delay_ms = delay_val;
+    }
+
+    VALUE rc = rb_hash_aref(options, sym_retry_codes);
+    if (!NIL_P(rc) && rb_obj_is_kind_of(rc, rb_cArray)) {
+        int len = (int)RARRAY_LEN(rc);
+        if (len > 0) {
+            retry_cfg->retry_http_codes = malloc(sizeof(int) * len);
+            if (retry_cfg->retry_http_codes) {
+                retry_cfg->retry_http_count = len;
+                for (int i = 0; i < len; i++) {
+                    retry_cfg->retry_http_codes[i] = NUM2INT(rb_ary_entry(rc, i));
+                }
+            }
+        }
+    }
 }
 
 static VALUE internal_execute(VALUE requests, VALUE options, int target, int stream) {
@@ -542,7 +726,18 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
 
     long timeout_sec;
     int max_conn;
-    parse_options(options, &timeout_sec, &max_conn);
+    retry_config_t retry_cfg;
+    parse_options(options, &timeout_sec, &max_conn, &retry_cfg);
+
+    if (stream || target > 0) {
+        if (retry_cfg.max_retries > 0 && stream)
+            rb_warn(
+                "FastCurl: retries are not supported in stream_execute, ignoring retries option");
+        if (retry_cfg.max_retries > 0 && target > 0)
+            rb_warn(
+                "FastCurl: retries are not supported in first_execute, ignoring retries option");
+        retry_cfg.max_retries = 0;
+    }
 
     multi_session_t session;
     session.multi = curl_multi_init();
@@ -559,7 +754,18 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
     session.requests = calloc(count, sizeof(request_ctx_t));
     if (!session.requests) {
         curl_multi_cleanup(session.multi);
+        if (retry_cfg.retry_http_codes)
+            free(retry_cfg.retry_http_codes);
         rb_raise(rb_eNoMemError, "failed to allocate request contexts");
+    }
+
+    int *invalid = calloc(count, sizeof(int));
+    if (!invalid) {
+        free(session.requests);
+        curl_multi_cleanup(session.multi);
+        if (retry_cfg.retry_http_codes)
+            free(retry_cfg.retry_http_codes);
+        rb_raise(rb_eNoMemError, "failed to allocate tracking array");
     }
 
     int valid_requests = 0;
@@ -569,12 +775,14 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
 
         if (!setup_easy_handle(&session.requests[i], req, timeout_sec)) {
             session.requests[i].done = 1;
+            invalid[i] = 1;
             continue;
         }
 
         CURLMcode mc = curl_multi_add_handle(session.multi, session.requests[i].easy);
         if (mc != CURLM_OK) {
             session.requests[i].done = 1;
+            invalid[i] = 1;
             continue;
         }
 
@@ -595,45 +803,102 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
             rb_ary_store(cctx.results, i, Qnil);
     }
 
-    if (has_fiber_scheduler()) {
-        for (;;) {
-            CURLMcode mc = curl_multi_perform(session.multi, &session.still_running);
-            if (mc != CURLM_OK)
-                break;
-            if (process_completed(&session, &cctx))
-                break;
-            if (session.still_running == 0)
+    run_multi_loop(&session, &cctx);
+
+    if (!stream && retry_cfg.max_retries > 0) {
+        int prev_all_failed = 0;
+
+        for (int attempt = 0; attempt < retry_cfg.max_retries; attempt++) {
+            int retry_count = 0;
+            int *retry_indices = malloc(sizeof(int) * count);
+            if (!retry_indices)
                 break;
 
-            int numfds = 0;
-            curl_multi_poll(session.multi, NULL, 0, FIBER_POLL_TIMEOUT_MS, &numfds);
-            rb_thread_schedule();
-        }
-        process_completed(&session, &cctx);
-    } else {
-        if (stream || target > 0) {
-            curl_multi_perform(session.multi, &session.still_running);
-            while (session.still_running > 0) {
-                rb_thread_call_without_gvl(poll_without_gvl, &session, unblock_perform, &session);
-                if (process_completed(&session, &cctx))
-                    break;
+            for (int i = 0; i < count; i++) {
+                if (invalid[i])
+                    continue;
+                if (!session.requests[i].done)
+                    continue;
+                if (should_retry(&session.requests[i], &retry_cfg)) {
+                    retry_indices[retry_count++] = i;
+                }
             }
-            process_completed(&session, &cctx);
-        } else {
-            session.still_running = 1;
-            curl_multi_perform(session.multi, &session.still_running);
-            rb_thread_call_without_gvl(perform_without_gvl, &session, unblock_perform, &session);
-            process_completed(&session, &cctx);
+
+            if (retry_count == 0) {
+                free(retry_indices);
+                break;
+            }
+
+            int done_count = 0;
+            for (int i = 0; i < count; i++) {
+                if (!invalid[i] && session.requests[i].done)
+                    done_count++;
+            }
+
+            int all_failed_this_round = (retry_count == done_count);
+
+            if (all_failed_this_round && prev_all_failed) {
+                free(retry_indices);
+                break;
+            }
+
+            prev_all_failed = all_failed_this_round;
+
+            retry_delay_sleep(retry_cfg.retry_delay_ms);
+
+            for (int r = 0; r < retry_count; r++) {
+                int idx = retry_indices[r];
+                request_ctx_t *ctx = &session.requests[idx];
+
+                curl_multi_remove_handle(session.multi, ctx->easy);
+
+                if (!request_ctx_reset_for_retry(ctx)) {
+                    ctx->done = 1;
+                    invalid[idx] = 1;
+                    continue;
+                }
+
+                VALUE req = rb_ary_entry(requests, idx);
+                if (!setup_easy_handle(ctx, req, timeout_sec)) {
+                    ctx->done = 1;
+                    invalid[idx] = 1;
+                    continue;
+                }
+
+                CURLMcode mc = curl_multi_add_handle(session.multi, ctx->easy);
+                if (mc != CURLM_OK) {
+                    ctx->done = 1;
+                    invalid[idx] = 1;
+                }
+            }
+
+            free(retry_indices);
+
+            cctx.completed = 0;
+            run_multi_loop(&session, &cctx);
         }
     }
 
     if (!stream) {
         for (int i = 0; i < count; i++) {
-            if (session.requests[i].done && rb_ary_entry(cctx.results, i) == Qnil) {
+            request_ctx_t *ctx = &session.requests[i];
+
+            if (invalid[i]) {
                 VALUE error_response = build_error_response("Invalid request configuration");
                 VALUE pair = rb_ary_new_from_args(2, INT2NUM(i), error_response);
                 rb_ary_store(cctx.results, i, pair);
+                continue;
             }
+
+            VALUE response;
+            if (ctx->curl_result == CURLE_OK) {
+                response = build_response(ctx);
+            } else {
+                response = build_error_response_with_code(curl_easy_strerror(ctx->curl_result),
+                                                          (int)ctx->curl_result);
+            }
+            VALUE pair = rb_ary_new_from_args(2, INT2NUM(i), response);
+            rb_ary_store(cctx.results, i, pair);
         }
     }
 
@@ -642,7 +907,10 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
         request_ctx_free(&session.requests[i]);
     }
     free(session.requests);
+    free(invalid);
     curl_multi_cleanup(session.multi);
+    if (retry_cfg.retry_http_codes)
+        free(retry_cfg.retry_http_codes);
 
     return stream ? Qnil : cctx.results;
 }
@@ -690,6 +958,9 @@ void Init_fast_curl(void) {
     id_connections = rb_intern("connections");
     id_count = rb_intern("count");
     id_keys = rb_intern("keys");
+    id_retries = rb_intern("retries");
+    id_retry_delay = rb_intern("retry_delay");
+    id_retry_codes = rb_intern("retry_codes");
 
     sym_status = ID2SYM(id_status);
     rb_gc_register_address(&sym_status);
@@ -709,6 +980,12 @@ void Init_fast_curl(void) {
     rb_gc_register_address(&sym_connections);
     sym_count = ID2SYM(id_count);
     rb_gc_register_address(&sym_count);
+    sym_retries = ID2SYM(id_retries);
+    rb_gc_register_address(&sym_retries);
+    sym_retry_delay = ID2SYM(id_retry_delay);
+    rb_gc_register_address(&sym_retry_delay);
+    sym_retry_codes = ID2SYM(id_retry_codes);
+    rb_gc_register_address(&sym_retry_codes);
 
     VALUE mFastCurl = rb_define_module("FastCurl");
 

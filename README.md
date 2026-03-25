@@ -76,6 +76,23 @@ FastCurl.stream_get(urls, connections: 50) do |index, response|
 end
 ```
 
+### Retry functionality (v0.2.0+)
+
+```ruby
+# Automatic retry on network errors (timeout, connection issues)
+results = FastCurl.get([
+  { url: "https://unreliable-api.com/data" }
+], retries: 3, retry_delay: 1000)  # 3 retries with 1s delay
+
+# Retry on specific HTTP status codes
+results = FastCurl.get([
+  { url: "https://api.example.com/data" }
+], retries: 2, retry_codes: [500, 502, 503], retry_delay: 500)
+
+# Disable retries (default is 1 retry)
+results = FastCurl.get(urls, retries: 0)
+```
+
 ### Inside Async
 
 ```ruby
@@ -119,6 +136,9 @@ end
 |---|---|---|
 | `connections` | 20 | Max parallel connections |
 | `timeout` | 30 | Per-request timeout in seconds |
+| `retries` | 1 | Number of retry attempts (0-10) |
+| `retry_delay` | 0 | Delay between retries in milliseconds |
+| `retry_codes` | [] | HTTP status codes to retry on |
 
 ## Performance
 
