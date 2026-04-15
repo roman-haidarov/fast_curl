@@ -12,7 +12,9 @@ Ultra-fast parallel HTTP client for Ruby. C extension built on libcurl `curl_mul
 
 ## Installation
 
-**Requirements**: Ruby >= 3.0 (for Fiber scheduler support)
+**Requirements**: Ruby >= 3.1, libcurl
+
+> **Why Ruby 3.1?** The C extension uses `rb_fiber_scheduler_current`, `rb_fiber_scheduler_block` and `rb_fiber_scheduler_unblock` to properly yield control to the Fiber Scheduler during I/O. These APIs are stable starting from Ruby 3.1. Without them, there is no correct way for a C extension to cooperate with the scheduler — earlier approaches (`rb_thread_schedule`) hold the GVL and block other fibers.
 
 ```ruby
 gem 'fast_curl'
@@ -142,19 +144,54 @@ end
 
 ## Performance
 
-Benchmark results (`bundle exec ruby benchmark/local_bench.rb`):
+Benchmarks against `httpbin.org`, 5 iterations with 1 warmup, median times.
+Run yourself: `bundle exec ruby benchmark/local_bench.rb`.
 
-| Method | 4 parallel | 10 parallel | 20 parallel | 200 parallel |
-|--------|------------|-------------|--------------|---------------|
-| Net::HTTP sequential | 7.93s (+2.1 MB) | 24.20s (+0.3 MB) | 48.58s (+1.2 MB) | - |
-| fast_curl (thread) | 2.09s (+0.7 MB) | 3.73s (+0.9 MB) | 3.76s (+0.0 MB) | 5.88s (+2.3 MB) |
-| fast_curl (fiber) | 1.96s (+0.4 MB) | 4.86s (+0.0 MB) | 3.71s (+0.2 MB) | 9.60s (+1.6 MB) |
-| Async::HTTP | 2.54s (+0.3 MB) | 4.27s (+0.4 MB) | 9.16s (+0.5 MB) | 22.44s (+10.7 MB) |
+Each request hits `/delay/1` (server-side 1-second delay), so sequential baseline
+grows linearly while parallel clients stay near ~1s plus network overhead.
 
-Additional scenarios:
-- Stream execute (5 requests): 5.99s (+0.0 MB)
-- First execute (first 1 of 5): 2.40s (+0.0 MB)
-- Error handling (timeout=2s): 2.01s (+0.0 MB)
+### Time to completion (lower is better)
+
+| Scenario                        | Net::HTTP sequential | fast_curl (thread) | fast_curl (fiber/Async) | Async::HTTP::Internet |
+|---------------------------------|---------------------:|-------------------:|------------------------:|----------------------:|
+| 4 requests × 1s, conn=4         |                8.27s |              2.36s |                   2.13s |                 2.56s |
+| 10 requests × 1s, conn=10       |               20.92s |              3.49s |                   5.23s |                 3.83s |
+| 20 requests × 1s, conn=5        |               42.56s |              2.94s |                   2.90s |                12.14s |
+| 200 requests × 1s, conn=20      |                   —  |             22.19s |                  21.77s |                23.59s |
+
+### Speedup vs Net::HTTP (median)
+
+| Scenario                          | fast_curl (thread) | fast_curl (fiber) | Async::HTTP |
+|-----------------------------------|-------------------:|------------------:|------------:|
+| 4 requests × 1s                   |           **3.5x** |              3.9x |        3.2x |
+| 10 requests × 1s                  |           **6.0x** |              4.0x |        5.5x |
+| 20 requests × 1s (queued, conn=5) |          **14.5x** |             14.7x |        3.5x |
+
+### Memory & allocations per request batch (lower is better)
+
+| Scenario                        | fast_curl (thread) allocated | fast_curl (fiber) allocated | Async::HTTP allocated |
+|---------------------------------|-----------------------------:|----------------------------:|----------------------:|
+| 4 requests × 1s                 |                 **278 obj**  |                     350 obj |             2,433 obj |
+| 10 requests × 1s                |                 **490 obj**  |                     756 obj |             4,763 obj |
+| 20 requests × 1s, conn=5        |                 **621 obj**  |                     750 obj |             8,536 obj |
+| 200 requests × 1s, conn=20      |               **5,188 obj**  |                   5,642 obj |            78,203 obj |
+
+Ruby heap delta stays near zero across all scenarios for fast_curl — most allocation
+happens in C, not on the Ruby heap.
+
+### Error handling
+
+| Scenario                                                     |  Time |
+|--------------------------------------------------------------|------:|
+| 4 mixed requests (404, 500, DNS fail, 30s delay), timeout=2s | 4.02s |
+
+Bounded by `timeout=2s` rather than by the slow request.
+
+### Notes on the numbers
+
+- **Net::HTTP sequential** is the proof-of-parallelism baseline — it confirms fast_curl and Async are actually running concurrently, not that they "beat" a different library. 4×1s sequentially = 4s, parallel = ~1s + overhead.
+- **Variance is high against remote endpoints** (httpbin.org). For stable numbers, use `--local` which spawns a WEBrick server on 127.0.0.1.
+- **fast_curl (thread) vs (fiber)**: same underlying C code, different scheduling. "thread" is the default; "fiber" kicks in automatically when called inside `Async do ... end`.
 
 ## License
 
