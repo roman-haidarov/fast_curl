@@ -16,7 +16,7 @@ Gem::Specification.new do |spec|
   spec.homepage      = "https://github.com/roman-haidarov/fast_curl"
   spec.license       = "MIT"
 
-  spec.required_ruby_version = ">= 3.0.0"
+  spec.required_ruby_version = ">= 3.1.0"
 
   spec.files         = Dir["lib/**/*.rb", "ext/**/*.{c,h,rb}", "LICENSE.txt", "README.md"]
   spec.extensions    = ["ext/fast_curl/extconf.rb"]
