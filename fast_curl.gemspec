@@ -16,7 +16,7 @@ Gem::Specification.new do |spec|
   spec.homepage      = "https://github.com/roman-haidarov/fast_curl"
   spec.license       = "MIT"
 
-  spec.required_ruby_version = ">= 3.1.0"
+  spec.required_ruby_version = ">= 2.7.0"
 
   spec.files         = Dir["lib/**/*.rb", "ext/**/*.{c,h,rb}", "LICENSE.txt", "README.md"]
   spec.extensions    = ["ext/fast_curl/extconf.rb"]
@@ -26,9 +26,8 @@ Gem::Specification.new do |spec|
   spec.add_dependency "json", "~> 2.0"
 
   # Development dependencies  
-  spec.add_development_dependency "rake", "~> 13.0"
-  spec.add_development_dependency "rake-compiler", "~> 1.2"
-  spec.add_development_dependency "minitest", "~> 5.0"
-  spec.add_development_dependency "benchmark-ips", "~> 2.0"
-  spec.add_development_dependency "webrick", "~> 1.8"
+  spec.add_development_dependency "rake", ">= 13.0", "< 14"
+  spec.add_development_dependency "rake-compiler", ">= 1.2", "< 2"
+  spec.add_development_dependency "minitest", ">= 5.14", "< 6"
+  spec.add_development_dependency "webrick", ">= 1.8", "< 2"
 end

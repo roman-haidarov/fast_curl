@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-24
+
+### Added
+- **Ruby 2.7 support** — minimum supported Ruby version lowered to `>= 2.7.0`; Fiber Scheduler-specific code is now guarded so the extension can build and run on Ruby versions without those C APIs.
+
+### Fixed
+- **Async/Fiber starvation** — long-running `FastCurl.get`/`execute` calls no longer hold the Async task and starve sibling fibers; the fiber path now delegates the blocking curl execution to a worker thread for the duration of the call so the scheduler can continue running other tasks.
+- **Async regression coverage** — added ticker/starvation tests to verify that another Async task keeps making progress while FastCurl performs long I/O.
+
+### Changed
+- **C extension refactoring** — reduced repetition and boilerplate with table-driven method dispatch, shared option parsing helpers, consolidated header formatting, and simpler cleanup paths without moving runtime logic into Ruby.
+
 ## [0.3.0] - 2025-04-15
 
 ### Changed
