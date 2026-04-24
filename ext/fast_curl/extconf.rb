@@ -8,6 +8,9 @@ have_header("ruby/fiber/scheduler.h")
 
 have_func("curl_multi_wakeup", "curl/curl.h")
 have_func("rb_fiber_scheduler_current", "ruby.h")
+have_func("rb_fiber_scheduler_block", "ruby.h")
+have_func("rb_fiber_scheduler_unblock", "ruby.h")
+have_func("rb_fiber_current", "ruby.h")
 have_func("rb_io_wait", "ruby.h")
 
 $CFLAGS << " -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter"
