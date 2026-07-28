@@ -12,9 +12,9 @@ Ultra-fast parallel HTTP client for Ruby. C extension built on libcurl `curl_mul
 
 ## Installation
 
-**Requirements**: Ruby >= 3.1, libcurl
+**Requirements**: Ruby >= 2.7, libcurl
 
-> **Why Ruby 3.1?** The C extension uses `rb_fiber_scheduler_current`, `rb_fiber_scheduler_block` and `rb_fiber_scheduler_unblock` to properly yield control to the Fiber Scheduler during I/O. These APIs are stable starting from Ruby 3.1. Without them, there is no correct way for a C extension to cooperate with the scheduler — earlier approaches (`rb_thread_schedule`) hold the GVL and block other fibers.
+> **Fiber Scheduler support requires Ruby >= 3.1.** The C extension uses `rb_fiber_scheduler_current`, `rb_fiber_scheduler_block` and `rb_fiber_scheduler_unblock` to yield control to the Fiber Scheduler during I/O; these APIs are stable from Ruby 3.1. On 2.7 and 3.0 the extension builds and runs correctly, but that code is compiled out — so a request made inside a scheduler blocks the whole thread and **no sibling fiber runs until it finishes**. Other OS threads are unaffected, since the GVL is still released. If you use `async`, use Ruby >= 3.1.
 
 ```ruby
 gem 'fast_curl'
@@ -50,14 +50,35 @@ end
 
 ### POST with body and headers
 
+Be explicit about the encoding — `json:` and `form:` set the matching
+`Content-Type` for you:
+
 ```ruby
 FastCurl.post([
   {
     url: "https://api.example.com/users",
     headers: { "Authorization" => "Bearer token" },
-    body: { name: "John" }
+    json: { name: "John" }               # application/json
+  },
+  {
+    url: "https://api.example.com/login",
+    form: { user: "john", pass: "x" }    # application/x-www-form-urlencoded
+  },
+  {
+    url: "https://api.example.com/blob",
+    headers: { "Content-Type" => "application/xml" },
+    body: "<user/>"                      # sent as-is
   }
 ])
+```
+
+A raw String `body:` without an explicit `Content-Type` is sent as
+`application/octet-stream`. A Hash `body:` is still encoded as JSON.
+
+Query parameters can be passed separately:
+
+```ruby
+FastCurl.get([{ url: "https://api.example.com/search", params: { q: "ruby", page: 2 } }])
 ```
 
 ### First N responses (cancel the rest)
@@ -78,13 +99,29 @@ FastCurl.stream_get(urls, connections: 50) do |index, response|
 end
 ```
 
-### Retry functionality (v0.2.0+)
+### Retries
+
+**Only idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS) are retried.**
+Several retryable curl errors — `GOT_NOTHING`, `SEND_ERROR`, `RECV_ERROR`,
+`PARTIAL_FILE` — can occur *after* the server has already accepted and processed
+the request, so replaying a `POST` or `PATCH` may duplicate its side effects.
+If you know the endpoint is safe to replay (e.g. it takes an idempotency key),
+opt in with `retry_non_idempotent: true`.
+
+`timeout` applies to a single attempt. Use `total_timeout` to bound the whole
+call, including retries and backoff:
+
+```ruby
+FastCurl.get(urls, timeout: 5, retries: 3, total_timeout: 10_000)
+```
+
+Delays use exponential backoff with full jitter, starting from `retry_delay`.
 
 ```ruby
 # Automatic retry on network errors (timeout, connection issues)
 results = FastCurl.get([
   { url: "https://unreliable-api.com/data" }
-], retries: 3, retry_delay: 1000)  # 3 retries with 1s delay
+], retries: 3, retry_delay: 1000)  # base delay 1s, doubling with jitter
 
 # Retry on specific HTTP status codes
 results = FastCurl.get([
@@ -109,13 +146,34 @@ end
 
 ## Response format
 
+Every response — successful or not — has the same keys:
+
 ```ruby
 [index, {
-  status: 200,             # HTTP status code (0 on error)
-  headers: { "Key" => "Value" },
-  body: "response body"
+  status: 200,                    # HTTP status code, 0 on error
+  headers: { "content-type" => "application/json" },
+  body: "response body",
+  error: nil,                     # nil, or :curl_error / :invalid_request /
+                                  # :not_completed / :deadline_exceeded
+  error_code: nil,                # CURLcode when error == :curl_error
+  effective_url: "https://...",   # final URL after redirects
+  attempts: 1                     # attempts made, including the first
 }]
 ```
+
+Check `response[:error]` rather than `response[:status] == 200`; a status of `0`
+always means the request never produced an HTTP response.
+
+Header names are normalised to lower case (HTTP/2 sends them that way and
+HTTP/1.1 may not), and lookups are case-insensitive:
+
+```ruby
+response[:headers]["Content-Type"]   # => "application/json"
+response[:headers]["content-type"]   # => "application/json"
+```
+
+Repeated fields fold into one comma-separated String. `set-cookie` cannot be
+folded and is **always** an Array, even for a single cookie.
 
 ## Available methods
 
@@ -137,10 +195,32 @@ end
 | Option | Default | Description |
 |---|---|---|
 | `connections` | 20 | Max parallel connections |
-| `timeout` | 30 | Per-request timeout in seconds |
-| `retries` | 1 | Number of retry attempts (0-10) |
-| `retry_delay` | 0 | Delay between retries in milliseconds |
+| `timeout` | 30 | Timeout for a single attempt, in seconds (1-300) |
+| `connect_timeout` | 10000 | Connection phase timeout, in milliseconds |
+| `total_timeout` | none | Wall-clock budget for the whole call, in milliseconds |
+| `retries` | 1 | Retry attempts for idempotent methods (0-10) |
+| `retry_delay` | 100 | Base backoff in milliseconds; doubles with jitter |
 | `retry_codes` | [] | HTTP status codes to retry on |
+| `retry_non_idempotent` | false | Also retry POST and PATCH |
+| `follow_redirects` | true | Follow `Location` headers |
+| `max_redirects` | 5 | Redirect limit (0-100) |
+
+DNS results and TLS sessions are cached process-wide, so repeated calls to the
+same host skip resolution and can resume TLS. TCP connections are pooled only
+within a single call — see Known limitations.
+
+## Known limitations
+
+- TCP connections are not reused across separate calls; each call builds its own
+  `curl_multi` handle. Sharing libcurl's connection cache across concurrent
+  multi handles deadlocks or crashes, so only the DNS and TLS session caches are
+  shared.
+- The whole response body is buffered in memory (100 MB cap per response);
+  `stream_execute` streams *responses*, not bodies.
+- HTTP/2 multiplexing is enabled, but `connections` caps in-flight requests and
+  TCP connections with the same number, so multiplexing cannot be exploited
+  beyond that limit.
+- No multipart, cookie jar, proxy or auth helpers yet.
 
 ## Performance
 

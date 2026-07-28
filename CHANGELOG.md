@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-22
+
+### Fixed
+
+- **Non-idempotent requests are no longer replayed (security/data integrity).**
+  `retries` defaulted to `1` and applied to every method, so a `POST` that failed
+  with `CURLE_GOT_NOTHING`/`SEND_ERROR`/`RECV_ERROR`/`PARTIAL_FILE` — errors that
+  routinely occur *after* the server has accepted and processed the request — was
+  silently sent a second time. The caller saw an error while the server saw two
+  charges. Only idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS) are retried
+  now; opt in with `retry_non_idempotent: true`.
+- **No wall-clock budget across retries.** `timeout` is per attempt, so
+  `timeout: 30, retries: 10` could run for 330s. Added `total_timeout` (ms),
+  which bounds the entire call and clamps each attempt's timeout to the time left.
+- **Thread churn under a Fiber scheduler.** `stream_execute` created a new OS
+  thread for every 50ms poll (~20/second, ~600 for a 30s stream). The poll loop
+  now runs until a transfer completes or a 2s slice expires; cancellation still
+  interrupts immediately via `curl_multi_wakeup`.
+- **Repeated DNS lookups and TLS handshakes between calls.** Added a
+  process-wide `CURLSH` sharing the DNS cache and TLS session cache, with
+  pthread locking. TCP connections themselves are still *not* pooled across
+  calls — see Known limitations.
+- **One bad request destroyed the whole batch.** An invalid header name, bad URL
+  scheme or unsupported method raised `ArgumentError` from the middle of the run
+  loop, discarding every other response. These are now per-request soft failures.
+- **Header name case depended on the negotiated protocol.** Names were returned
+  verbatim, so HTTP/2 (always lowercase) and HTTP/1.1 produced different keys for
+  the same code. Names are normalised to lowercase and `FastCurl::Headers` looks
+  up case-insensitively.
+- **Multi-value headers had an unstable type.** One `Set-Cookie` returned a
+  String, two returned an Array. `set-cookie` is now always an Array; other
+  repeated fields fold into one comma-separated String (RFC 9110 5.3).
+- **String bodies were mislabelled.** libcurl defaults a raw `POSTFIELDS` body to
+  `application/x-www-form-urlencoded`, so a hand-built JSON string went out
+  labelled as a form. Use `json:`/`form:` to be explicit; a raw `body:` String now
+  defaults to `application/octet-stream`.
+
+### Added
+
+- `total_timeout`, `connect_timeout`, `follow_redirects`, `max_redirects` and
+  `retry_non_idempotent` options. There was previously no connect timeout at all
+  and redirects could not be disabled.
+- Exponential backoff with full jitter between retries; `retry_delay` now
+  defaults to 100ms instead of 0 and is the base of the backoff.
+- `:error` (Symbol), `:effective_url` and `:attempts` on every response. Failed
+  responses now carry exactly the same keys as successful ones.
+- `json:`, `form:` and `params:` request options.
+- `FastCurl::Headers`, a case-insensitive Hash subclass.
+
+- **`stream_execute` invoked the caller's block with garbage.** The response
+  headers hash was created with `rb_class_new_instance`, which runs
+  `Hash#initialize` and passes it the block of the current frame. Inside
+  `stream_execute` the user's block therefore became the hash's default proc and
+  was invoked with `(hash, key)` on every first-seen header, before the real
+  `[index, response]` pair. Found by running under the real `async` gem.
+
+### Known limitations
+
+- **TCP connections are not reused between separate calls.** Each call builds
+  its own multi handle. Sharing libcurl's connection cache
+  (`CURL_LOCK_DATA_CONNECT`) was implemented and then reverted: with several
+  threads running batches concurrently it deadlocks against
+  `CURLMOPT_MAX_TOTAL_CONNECTIONS`, and without that limit libcurl 8.5.0
+  segfaults inside `curl_multi_perform`. A correct fix needs a persistent
+  per-thread multi handle. Regression test:
+  `TestConcurrency#test_batches_from_many_threads`.
+- On Ruby 2.7 and 3.0 the Fiber Scheduler code is compiled out, so a request
+  made inside a scheduler blocks the whole thread and no sibling fiber runs
+  until it completes. Verified by building with the scheduler C API disabled:
+  the functional suite passes, the starvation tests fail as expected.
+- Cancellation of an in-flight request relies on `curl_multi_wakeup`; on libcurl
+  older than 7.68 it is a no-op and a killed thread or stopped task waits for the
+  request to finish.
+
+### Changed
+
+- **Breaking:** response header keys are lowercase; `set-cookie` is always an
+  Array; a raw String `body:` is labelled `application/octet-stream`; `POST` and
+  `PATCH` are not retried unless `retry_non_idempotent: true`.
+
 ## [0.3.1] - 2026-04-24
 
 ### Added
@@ -17,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **C extension refactoring** — reduced repetition and boilerplate with table-driven method dispatch, shared option parsing helpers, consolidated header formatting, and simpler cleanup paths without moving runtime logic into Ruby.
 
-## [0.3.0] - 2025-04-15
+## [0.3.0] - 2026-04-15
 
 ### Changed
 - **Minimum Ruby version raised to 3.1** — required for `rb_fiber_scheduler_current`, `rb_fiber_scheduler_block`/`unblock` APIs used in the new Fiber Scheduler integration
@@ -35,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RB_GC_GUARD` for Ruby string objects passed to curl handles
 - GVL/Fiber scheduler test suite (`test_gvl_and_fiber_scheduler.rb`) verifying that other threads and fibers actually run during I/O
 
-## [0.2.0] - 2024-03-25
+## [0.2.0] - 2026-03-25
 
 ### Added
 - **Retry functionality**: Automatic retry for failed requests
@@ -52,12 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retry delay implemented with proper GVL release and fiber scheduler support
 - All retry attempts respect the original request timeout settings
 
-## [0.1.1] - 2024-03-24
+## [0.1.1] - 2026-03-24
 
 ### Added
 - HTTP/2 multiplexing support
 
-## [0.1.0] - 2024-03-24
+## [0.1.0] - 2026-03-21
 
 ### Added
 - Initial release
