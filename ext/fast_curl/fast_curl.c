@@ -11,7 +11,10 @@
 #define FAST_CURL_HAVE_FIBER_SCHEDULER 1
 #endif
 #include <curl/curl.h>
+#include <ctype.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -23,20 +26,24 @@
 #define FAST_CURL_NORETURN
 #endif
 
-#define MAX_RESPONSE_SIZE     (100 * 1024 * 1024)
-#define MAX_REDIRECTS         5
-#define MAX_TIMEOUT           300
-#define MAX_RETRIES           10
-#define MAX_REQUESTS          10000
-#define MAX_CONNECTIONS       100
-#define MAX_RETRY_DELAY_MS    30000
-#define DEFAULT_RETRIES       1
-#define DEFAULT_RETRY_DELAY   0
-#define INITIAL_BUF_CAP       8192
-#define INITIAL_HEADER_CAP    16
-#define POLL_TIMEOUT_MS       50
-#define FIBER_POLL_TIMEOUT_MS 10
-#define HEADER_LINE_BUF_SIZE  512
+#define MAX_RESPONSE_SIZE          (100 * 1024 * 1024)
+#define MAX_REDIRECTS              5
+#define MAX_TIMEOUT                300
+#define MAX_RETRIES                10
+#define MAX_REQUESTS               10000
+#define MAX_CONNECTIONS            100
+#define MAX_RETRY_DELAY_MS         30000
+#define DEFAULT_RETRIES            1
+#define DEFAULT_RETRY_DELAY        100
+#define DEFAULT_CONNECT_TIMEOUT_MS 10000L
+#define MAX_CONNECT_TIMEOUT_MS     300000L
+#define MAX_TOTAL_TIMEOUT_MS       3600000L
+#define INITIAL_BUF_CAP            8192
+#define INITIAL_HEADER_CAP         16
+#define POLL_TIMEOUT_MS            50
+#define POLL_SLICE_MS              2000
+#define FIBER_POLL_TIMEOUT_MS      10
+#define HEADER_LINE_BUF_SIZE       512
 
 static const CURLcode DEFAULT_RETRYABLE_CURLE[] = {
     CURLE_COULDNT_CONNECT, CURLE_OPERATION_TIMEDOUT, CURLE_SEND_ERROR,       CURLE_RECV_ERROR,
@@ -57,6 +64,14 @@ typedef enum {
     KEY_RETRIES,
     KEY_RETRY_DELAY,
     KEY_RETRY_CODES,
+    KEY_CONNECT_TIMEOUT,
+    KEY_TOTAL_TIMEOUT,
+    KEY_RETRY_NON_IDEMPOTENT,
+    KEY_FOLLOW_REDIRECTS,
+    KEY_MAX_REDIRECTS,
+    KEY_EFFECTIVE_URL,
+    KEY_ERROR,
+    KEY_ATTEMPTS,
     KEY_LAST
 } key_id_t;
 
@@ -66,9 +81,110 @@ static VALUE fast_syms[KEY_LAST];
 #define SYM(key) fast_syms[key]
 
 static const char *const KEY_NAMES[KEY_LAST] = {
-    "status",  "headers",     "body",  "error_code", "url",         "method",
-    "timeout", "connections", "count", "retries",    "retry_delay", "retry_codes",
+    "status",
+    "headers",
+    "body",
+    "error_code",
+    "url",
+    "method",
+    "timeout",
+    "connections",
+    "count",
+    "retries",
+    "retry_delay",
+    "retry_codes",
+    "connect_timeout",
+    "total_timeout",
+    "retry_non_idempotent",
+    "follow_redirects",
+    "max_redirects",
+    "effective_url",
+    "error",
+    "attempts",
 };
+
+typedef enum {
+    ERR_CURL,
+    ERR_INVALID_REQUEST,
+    ERR_NOT_COMPLETED,
+    ERR_DEADLINE,
+    ERR_LAST
+} error_kind_t;
+
+static VALUE error_syms[ERR_LAST];
+
+static const char *const ERROR_KIND_NAMES[ERR_LAST] = {
+    "curl_error",
+    "invalid_request",
+    "not_completed",
+    "deadline_exceeded",
+};
+
+static long long fast_now_ms(void) {
+    struct timespec ts;
+#ifdef CLOCK_MONOTONIC
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static uint64_t fast_rand_state;
+
+/* Small xorshift PRNG; only used to jitter retry delays. */
+static uint32_t fast_rand(void) {
+    uint64_t x = fast_rand_state;
+    if (x == 0)
+        x = (uint64_t)fast_now_ms() | 1ULL;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    fast_rand_state = x;
+    return (uint32_t)(x >> 32);
+}
+
+/* Process-wide DNS and TLS session cache, so repeated calls to the same host
+   skip resolution and can resume TLS instead of doing a full handshake. */
+static CURLSH *fast_share = NULL;
+static pthread_mutex_t fast_share_locks[CURL_LOCK_DATA_LAST];
+
+static void fast_share_lock(CURL *handle, curl_lock_data data, curl_lock_access access,
+                            void *userptr) {
+    (void)handle;
+    (void)access;
+    (void)userptr;
+    if ((int)data > 0 && (int)data < CURL_LOCK_DATA_LAST)
+        pthread_mutex_lock(&fast_share_locks[data]);
+}
+
+static void fast_share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
+    (void)handle;
+    (void)userptr;
+    if ((int)data > 0 && (int)data < CURL_LOCK_DATA_LAST)
+        pthread_mutex_unlock(&fast_share_locks[data]);
+}
+
+static void fast_share_init(void) {
+    for (int i = 0; i < CURL_LOCK_DATA_LAST; i++)
+        pthread_mutex_init(&fast_share_locks[i], NULL);
+
+    fast_share = curl_share_init();
+    if (!fast_share)
+        return;
+
+    curl_share_setopt(fast_share, CURLSHOPT_LOCKFUNC, fast_share_lock);
+    curl_share_setopt(fast_share, CURLSHOPT_UNLOCKFUNC, fast_share_unlock);
+    curl_share_setopt(fast_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(fast_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+
+    /* CURL_LOCK_DATA_CONNECT is deliberately NOT shared. Sharing the connection
+       cache between multi handles running concurrently in different threads
+       deadlocks against CURLMOPT_MAX_TOTAL_CONNECTIONS, and removing that limit
+       turns the deadlock into a segfault inside curl_multi_perform (reproduced
+       on libcurl 8.5.0 with two threads x 25 requests). Cross-call TCP reuse
+       needs a persistent multi handle per thread, not a shared cache. */
+}
 
 typedef struct {
     char *data;
@@ -212,7 +328,18 @@ typedef struct {
     int active;
     CURLcode curl_result;
     long http_status;
+    int idempotent;
+    int attempts;
+    const char *setup_error;
+    int setup_error_fatal;
 } request_ctx_t;
+
+static VALUE fast_validation_error = Qnil;
+#define SET_SETUP_ERROR(ctx, msg, fatal)    \
+    do {                                    \
+        (ctx)->setup_error = (msg);         \
+        (ctx)->setup_error_fatal = (fatal); \
+    } while (0)
 
 static inline void request_ctx_init(request_ctx_t *ctx, int index) {
     ctx->easy = NULL;
@@ -224,6 +351,10 @@ static inline void request_ctx_init(request_ctx_t *ctx, int index) {
     ctx->active = 0;
     ctx->curl_result = CURLE_OK;
     ctx->http_status = 0;
+    ctx->idempotent = 1;
+    ctx->attempts = 0;
+    ctx->setup_error = NULL;
+    ctx->setup_error_fatal = 0;
 }
 
 static void request_ctx_free(request_ctx_t *ctx) {
@@ -267,6 +398,8 @@ static int request_ctx_reset_for_retry(request_ctx_t *ctx) {
     ctx->active = 0;
     ctx->curl_result = CURLE_OK;
     ctx->http_status = 0;
+    ctx->setup_error = NULL;
+    ctx->setup_error_fatal = 0;
     return 1;
 }
 
@@ -291,7 +424,17 @@ typedef struct {
     long retry_delay_ms;
     int *retry_http_codes;
     int retry_http_count;
+    int retry_non_idempotent;
 } retry_config_t;
+
+typedef struct {
+    long timeout_sec;
+    long connect_timeout_ms;
+    long total_timeout_ms;
+    long follow_redirects;
+    long max_redirects;
+    long long deadline_ms;
+} request_options_t;
 
 static int contains_header_injection(const char *str, long len) {
     for (long i = 0; i < len; i++) {
@@ -392,24 +535,37 @@ static void run_via_fiber_worker(VALUE scheduler, void *(*func)(void *), void *a
 }
 #endif
 
-static void headers_hash_store(VALUE headers_hash, VALUE key, VALUE val) {
+static VALUE fast_cHeaders = Qnil;
+static VALUE new_headers_hash(void) {
+    if (!NIL_P(fast_cHeaders))
+        return rb_obj_alloc(fast_cHeaders);
+    return rb_hash_new();
+}
+
+static void headers_hash_store(VALUE headers_hash, VALUE key, VALUE val, int always_array) {
     VALUE existing = rb_hash_aref(headers_hash, key);
 
     if (NIL_P(existing)) {
-        rb_hash_aset(headers_hash, key, val);
-    } else if (RB_TYPE_P(existing, T_ARRAY)) {
-        rb_ary_push(existing, val);
-    } else {
-        VALUE values = rb_ary_new_from_args(2, existing, val);
-        rb_hash_aset(headers_hash, key, values);
+        rb_hash_aset(headers_hash, key, always_array ? rb_ary_new_from_args(1, val) : val);
+        return;
     }
+
+    if (RB_TYPE_P(existing, T_ARRAY)) {
+        rb_ary_push(existing, val);
+        return;
+    }
+
+    VALUE joined = rb_str_dup(existing);
+    rb_str_cat_cstr(joined, ", ");
+    rb_str_append(joined, val);
+    rb_hash_aset(headers_hash, key, joined);
 }
 
 static VALUE build_response(request_ctx_t *ctx) {
     long status = 0;
     curl_easy_getinfo(ctx->easy, CURLINFO_RESPONSE_CODE, &status);
 
-    VALUE headers_hash = rb_hash_new();
+    VALUE headers_hash = new_headers_hash();
     for (int i = 0; i < ctx->headers.count; i++) {
         const char *hdr = ctx->headers.entries[i].str;
         size_t hdr_len = ctx->headers.entries[i].len;
@@ -418,6 +574,12 @@ static VALUE build_response(request_ctx_t *ctx) {
             continue;
 
         VALUE key = rb_str_new(hdr, colon - hdr);
+        char *kp = RSTRING_PTR(key);
+        long klen = RSTRING_LEN(key);
+        for (long k = 0; k < klen; k++)
+            kp[k] = (char)tolower((unsigned char)kp[k]);
+        int always_array = (klen == 10 && memcmp(kp, "set-cookie", 10) == 0);
+
         const char *vs = colon + 1;
         const char *ve = hdr + hdr_len;
 
@@ -427,7 +589,7 @@ static VALUE build_response(request_ctx_t *ctx) {
             ve--;
 
         VALUE val = rb_str_new(vs, ve - vs);
-        headers_hash_store(headers_hash, key, val);
+        headers_hash_store(headers_hash, key, val, always_array);
     }
 
     VALUE body_str =
@@ -437,19 +599,33 @@ static VALUE build_response(request_ctx_t *ctx) {
     rb_hash_aset(result, SYM(KEY_STATUS), LONG2NUM(status));
     rb_hash_aset(result, SYM(KEY_HEADERS), headers_hash);
     rb_hash_aset(result, SYM(KEY_BODY), body_str);
+    rb_hash_aset(result, SYM(KEY_ERROR), Qnil);
+    rb_hash_aset(result, SYM(KEY_ERROR_CODE), Qnil);
+    rb_hash_aset(result, SYM(KEY_ATTEMPTS), INT2NUM(ctx->attempts));
+
+    char *effective = NULL;
+    if (curl_easy_getinfo(ctx->easy, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK && effective)
+        rb_hash_aset(result, SYM(KEY_EFFECTIVE_URL), rb_str_new_cstr(effective));
+    else
+        rb_hash_aset(result, SYM(KEY_EFFECTIVE_URL), Qnil);
+
     return result;
 }
 
-static VALUE build_error_response(const char *message) {
+static VALUE build_error_response(const char *message, error_kind_t kind, int attempts) {
     VALUE r = rb_hash_new();
     rb_hash_aset(r, SYM(KEY_STATUS), INT2NUM(0));
     rb_hash_aset(r, SYM(KEY_HEADERS), Qnil);
     rb_hash_aset(r, SYM(KEY_BODY), rb_str_new_cstr(message));
+    rb_hash_aset(r, SYM(KEY_ERROR), error_syms[kind]);
+    rb_hash_aset(r, SYM(KEY_ERROR_CODE), Qnil);
+    rb_hash_aset(r, SYM(KEY_EFFECTIVE_URL), Qnil);
+    rb_hash_aset(r, SYM(KEY_ATTEMPTS), INT2NUM(attempts));
     return r;
 }
 
-static VALUE build_error_response_with_code(const char *message, int error_code) {
-    VALUE r = build_error_response(message);
+static VALUE build_error_response_with_code(const char *message, int error_code, int attempts) {
+    VALUE r = build_error_response(message, ERR_CURL, attempts);
     rb_hash_aset(r, SYM(KEY_ERROR_CODE), INT2NUM(error_code));
     return r;
 }
@@ -474,20 +650,33 @@ static int is_valid_url(const char *url) {
             return _r;                                         \
     } while (0)
 
-static CURLcode setup_basic_options(CURL *easy, const char *url_str, long timeout_sec,
+static CURLcode setup_basic_options(CURL *easy, const char *url_str, const request_options_t *opts,
                                     request_ctx_t *ctx) {
+    long timeout_ms = opts->timeout_sec * 1000L;
+
+    if (opts->deadline_ms > 0) {
+        long long remaining = opts->deadline_ms - fast_now_ms();
+        if (remaining < 1)
+            remaining = 1;
+        if (remaining < (long long)timeout_ms)
+            timeout_ms = (long)remaining;
+    }
+
     CURL_SETOPT_CHECK(easy, CURLOPT_URL, url_str);
     CURL_SETOPT_CHECK(easy, CURLOPT_WRITEFUNCTION, write_callback);
     CURL_SETOPT_CHECK(easy, CURLOPT_WRITEDATA, &ctx->body);
     CURL_SETOPT_CHECK(easy, CURLOPT_HEADERFUNCTION, header_callback);
     CURL_SETOPT_CHECK(easy, CURLOPT_HEADERDATA, &ctx->headers);
-    CURL_SETOPT_CHECK(easy, CURLOPT_TIMEOUT, timeout_sec);
+    CURL_SETOPT_CHECK(easy, CURLOPT_TIMEOUT_MS, timeout_ms);
+    CURL_SETOPT_CHECK(easy, CURLOPT_CONNECTTIMEOUT_MS, opts->connect_timeout_ms);
     CURL_SETOPT_CHECK(easy, CURLOPT_NOSIGNAL, 1L);
-    CURL_SETOPT_CHECK(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    CURL_SETOPT_CHECK(easy, CURLOPT_MAXREDIRS, MAX_REDIRECTS);
+    CURL_SETOPT_CHECK(easy, CURLOPT_FOLLOWLOCATION, opts->follow_redirects);
+    CURL_SETOPT_CHECK(easy, CURLOPT_MAXREDIRS, opts->max_redirects);
     CURL_SETOPT_CHECK(easy, CURLOPT_ACCEPT_ENCODING, "");
     CURL_SETOPT_CHECK(easy, CURLOPT_PRIVATE, (char *)ctx);
     CURL_SETOPT_CHECK(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    if (fast_share)
+        CURL_SETOPT_CHECK(easy, CURLOPT_SHARE, fast_share);
     return CURLE_OK;
 }
 
@@ -518,12 +707,13 @@ typedef struct {
     int post;
     int nobody;
     int allows_body;
+    int idempotent;
 } http_method_t;
 
 static const http_method_t HTTP_METHODS[] = {
-    {"GET", NULL, 0, 0, 0},          {"POST", NULL, 1, 0, 1},     {"PUT", "PUT", 0, 0, 1},
-    {"DELETE", "DELETE", 0, 0, 1},   {"PATCH", "PATCH", 0, 0, 1}, {"HEAD", NULL, 0, 1, 0},
-    {"OPTIONS", "OPTIONS", 0, 0, 0},
+    {"GET", NULL, 0, 0, 0, 1},          {"POST", NULL, 1, 0, 1, 0},     {"PUT", "PUT", 0, 0, 1, 1},
+    {"DELETE", "DELETE", 0, 0, 1, 1},   {"PATCH", "PATCH", 0, 0, 1, 0}, {"HEAD", NULL, 0, 1, 0, 1},
+    {"OPTIONS", "OPTIONS", 0, 0, 0, 1},
 };
 
 static const http_method_t *find_http_method(const char *name) {
@@ -544,29 +734,52 @@ static CURLcode apply_http_method(CURL *easy, const http_method_t *method) {
     return CURLE_OK;
 }
 
-static CURLcode setup_method_and_body(CURL *easy, VALUE method_value, VALUE body) {
-    const char *name = NIL_P(method_value) ? "GET" : StringValueCStr(method_value);
-    const http_method_t *method = find_http_method(name);
+static int setup_method_and_body(request_ctx_t *ctx, VALUE method_value, VALUE body) {
+    const http_method_t *method;
     int has_body = !NIL_P(body);
+    char name[32];
 
-    if (!method)
-        rb_raise(rb_eArgError, "Unsupported HTTP method: %s", name);
-    if (has_body && !method->allows_body)
-        rb_raise(rb_eArgError, "%s requests must not include a body", method->name);
+    if (NIL_P(method_value)) {
+        memcpy(name, "GET", 4);
+    } else {
+        if (!RB_TYPE_P(method_value, T_STRING)) {
+            SET_SETUP_ERROR(ctx, "Unsupported HTTP method", 1);
+            return 0;
+        }
+        long len = RSTRING_LEN(method_value);
+        if (len <= 0 || len >= (long)sizeof(name)) {
+            SET_SETUP_ERROR(ctx, "Unsupported HTTP method", 1);
+            return 0;
+        }
+        memcpy(name, RSTRING_PTR(method_value), (size_t)len);
+        name[len] = '\0';
+    }
 
-    CURLcode res = apply_http_method(easy, method);
-    if (res != CURLE_OK)
-        return res;
+    method = find_http_method(name);
+    if (!method) {
+        SET_SETUP_ERROR(ctx, "Unsupported HTTP method", 1);
+        return 0;
+    }
+    if (has_body && !method->allows_body) {
+        SET_SETUP_ERROR(ctx, "This HTTP method must not include a body", 1);
+        return 0;
+    }
 
-    if (has_body) {
-        res = set_body(easy, body);
-        if (res != CURLE_OK)
-            return res;
+    ctx->idempotent = method->idempotent;
+
+    if (apply_http_method(ctx->easy, method) != CURLE_OK) {
+        SET_SETUP_ERROR(ctx, "Failed to configure HTTP method", 0);
+        return 0;
+    }
+
+    if (has_body && set_body(ctx->easy, body) != CURLE_OK) {
+        SET_SETUP_ERROR(ctx, "Failed to configure request body", 0);
+        return 0;
     }
 
     RB_GC_GUARD(method_value);
     RB_GC_GUARD(body);
-    return CURLE_OK;
+    return 1;
 }
 
 static void append_request_header(request_ctx_t *ctx, const char *buf) {
@@ -608,23 +821,42 @@ static void append_formatted_header(request_ctx_t *ctx, const char *key, long ke
         free(line);
 }
 
+static VALUE header_part_to_str(VALUE v) {
+    if (RB_TYPE_P(v, T_STRING))
+        return v;
+    if (SYMBOL_P(v))
+        return rb_sym2str(v);
+    return rb_String(v);
+}
+
 static int header_iter_cb(VALUE key, VALUE val, VALUE arg) {
     request_ctx_t *ctx = (request_ctx_t *)arg;
-    VALUE key_str = rb_String(key);
-    VALUE val_str = NIL_P(val) ? Qnil : rb_String(val);
-    const char *k = RSTRING_PTR(key_str);
-    long klen = RSTRING_LEN(key_str);
+    VALUE key_str, val_str;
+    const char *k;
+    long klen;
     const char *v = NULL;
     long vlen = 0;
 
-    if (!is_valid_header_name(k, klen) || contains_header_injection(k, klen))
-        rb_raise(rb_eArgError, "Invalid HTTP header name");
+    if (ctx->setup_error)
+        return ST_STOP;
+
+    key_str = header_part_to_str(key);
+    val_str = NIL_P(val) ? Qnil : header_part_to_str(val);
+    k = RSTRING_PTR(key_str);
+    klen = RSTRING_LEN(key_str);
+
+    if (!is_valid_header_name(k, klen) || contains_header_injection(k, klen)) {
+        SET_SETUP_ERROR(ctx, "Invalid HTTP header name", 1);
+        return ST_STOP;
+    }
 
     if (!NIL_P(val_str) && RSTRING_LEN(val_str) > 0) {
         v = RSTRING_PTR(val_str);
         vlen = RSTRING_LEN(val_str);
-        if (contains_header_injection(v, vlen))
-            rb_raise(rb_eArgError, "Invalid HTTP header value");
+        if (contains_header_injection(v, vlen)) {
+            SET_SETUP_ERROR(ctx, "Invalid HTTP header value", 1);
+            return ST_STOP;
+        }
     }
 
     append_formatted_header(ctx, k, klen, v, vlen);
@@ -634,40 +866,58 @@ static int header_iter_cb(VALUE key, VALUE val, VALUE arg) {
     return ST_CONTINUE;
 }
 
-static int setup_easy_handle(request_ctx_t *ctx, VALUE request, long timeout_sec) {
-    Check_Type(request, T_HASH);
+static int setup_easy_handle(request_ctx_t *ctx, VALUE request, const request_options_t *opts) {
+    if (!RB_TYPE_P(request, T_HASH)) {
+        SET_SETUP_ERROR(ctx, "Request must be a Hash", 1);
+        return 0;
+    }
 
     VALUE url = hash_aref_key(request, KEY_URL);
     VALUE method = hash_aref_key(request, KEY_METHOD);
     VALUE headers = hash_aref_key(request, KEY_HEADERS);
     VALUE body = hash_aref_key(request, KEY_BODY);
 
-    if (NIL_P(url))
+    if (NIL_P(url)) {
+        SET_SETUP_ERROR(ctx, "Missing :url", 0);
         return 0;
+    }
+    if (!RB_TYPE_P(url, T_STRING) || memchr(RSTRING_PTR(url), '\0', RSTRING_LEN(url))) {
+        SET_SETUP_ERROR(ctx, "Invalid URL", 1);
+        return 0;
+    }
 
     const char *url_str = StringValueCStr(url);
-    if (!is_valid_url(url_str))
-        rb_raise(rb_eArgError, "Invalid URL: %s", url_str);
-
-    CURLcode res = setup_basic_options(ctx->easy, url_str, timeout_sec, ctx);
-    if (res != CURLE_OK)
+    if (!is_valid_url(url_str)) {
+        SET_SETUP_ERROR(ctx, "Invalid URL (expected http:// or https://, max 2048 bytes)", 1);
         return 0;
+    }
 
-    res = setup_security_options(ctx->easy);
-    if (res != CURLE_OK)
+    if (setup_basic_options(ctx->easy, url_str, opts, ctx) != CURLE_OK) {
+        SET_SETUP_ERROR(ctx, "Failed to configure request", 0);
         return 0;
+    }
 
-    res = setup_method_and_body(ctx->easy, method, body);
-    if (res != CURLE_OK)
+    if (setup_security_options(ctx->easy) != CURLE_OK) {
+        SET_SETUP_ERROR(ctx, "Failed to configure TLS options", 0);
+        return 0;
+    }
+
+    if (!setup_method_and_body(ctx, method, body))
         return 0;
 
     if (!NIL_P(headers)) {
-        Check_Type(headers, T_HASH);
+        if (!RB_TYPE_P(headers, T_HASH)) {
+            SET_SETUP_ERROR(ctx, ":headers must be a Hash", 1);
+            return 0;
+        }
         rb_hash_foreach(headers, header_iter_cb, (VALUE)ctx);
+        if (ctx->setup_error)
+            return 0;
         if (ctx->req_headers) {
-            res = curl_easy_setopt(ctx->easy, CURLOPT_HTTPHEADER, ctx->req_headers);
-            if (res != CURLE_OK)
+            if (curl_easy_setopt(ctx->easy, CURLOPT_HTTPHEADER, ctx->req_headers) != CURLE_OK) {
+                SET_SETUP_ERROR(ctx, "Failed to set request headers", 0);
                 return 0;
+            }
         }
     }
 
@@ -679,14 +929,25 @@ static int setup_easy_handle(request_ctx_t *ctx, VALUE request, long timeout_sec
     return 1;
 }
 
+/* Poll until something actually completes, or the slice budget expires.
+   Previously this returned after every single 50ms poll, which under a fiber
+   scheduler meant a fresh OS thread twenty times a second. Cancellation still
+   breaks out immediately via curl_multi_wakeup. */
 static void *poll_without_gvl(void *arg) {
     multi_session_t *s = (multi_session_t *)arg;
-    if (s->cancelled)
-        return NULL;
+    long long started = fast_now_ms();
+    int before = s->still_running;
 
-    int numfds = 0;
-    curl_multi_poll(s->multi, NULL, 0, POLL_TIMEOUT_MS, &numfds);
-    curl_multi_perform(s->multi, &s->still_running);
+    while (!s->cancelled) {
+        int numfds = 0;
+        curl_multi_poll(s->multi, NULL, 0, POLL_TIMEOUT_MS, &numfds);
+        curl_multi_perform(s->multi, &s->still_running);
+
+        if (s->still_running == 0 || s->still_running < before)
+            break;
+        if (fast_now_ms() - started >= POLL_SLICE_MS)
+            break;
+    }
     return NULL;
 }
 
@@ -709,9 +970,11 @@ static VALUE build_result_pair(int index, VALUE response) {
     return rb_ary_new_from_args(2, INT2NUM(index), response);
 }
 
-static int record_immediate_error(completion_ctx_t *cctx, int index, const char *message) {
+static int record_immediate_error(completion_ctx_t *cctx, int index, const char *message,
+                                  int attempts) {
     if (cctx->stream || cctx->target > 0) {
-        VALUE pair = build_result_pair(index, build_error_response(message));
+        VALUE pair =
+            build_result_pair(index, build_error_response(message, ERR_INVALID_REQUEST, attempts));
 
         if (cctx->stream)
             rb_yield(pair);
@@ -751,10 +1014,11 @@ static int process_completed(multi_session_t *session, completion_ctx_t *cctx) {
             curl_easy_getinfo(ctx->easy, CURLINFO_RESPONSE_CODE, &ctx->http_status);
 
         if (cctx->stream || cctx->target > 0) {
-            VALUE response = (msg->data.result == CURLE_OK)
-                                 ? build_response(ctx)
-                                 : build_error_response_with_code(
-                                       curl_easy_strerror(msg->data.result), (int)msg->data.result);
+            VALUE response =
+                (msg->data.result == CURLE_OK)
+                    ? build_response(ctx)
+                    : build_error_response_with_code(curl_easy_strerror(msg->data.result),
+                                                     (int)msg->data.result, ctx->attempts);
             VALUE pair = build_result_pair(ctx->index, response);
 
             if (cctx->stream)
@@ -782,30 +1046,34 @@ static int next_pending_index(multi_session_t *session) {
 }
 
 static int activate_request(multi_session_t *session, VALUE requests, int idx, int *invalid,
-                            long timeout_sec) {
+                            const request_options_t *opts) {
     request_ctx_t *ctx = &session->requests[idx];
 
     if (invalid[idx] || ctx->done)
         return 0;
 
-    if (!request_ctx_prepare_easy(ctx))
+    if (!request_ctx_prepare_easy(ctx)) {
+        SET_SETUP_ERROR(ctx, "Failed to allocate a curl handle", 0);
+        return 0;
+    }
+
+    if (!setup_easy_handle(ctx, rb_ary_entry(requests, idx), opts))
         return 0;
 
-    if (!setup_easy_handle(ctx, rb_ary_entry(requests, idx), timeout_sec))
+    if (curl_multi_add_handle(session->multi, ctx->easy) != CURLM_OK) {
+        SET_SETUP_ERROR(ctx, "Failed to schedule the request", 0);
         return 0;
+    }
 
-    CURLMcode mc = curl_multi_add_handle(session->multi, ctx->easy);
-    if (mc != CURLM_OK)
-        return 0;
-
+    ctx->attempts++;
     ctx->active = 1;
     ctx->done = 0;
     session->active_count++;
     return 1;
 }
 
-static int fill_slots(multi_session_t *session, VALUE requests, int *invalid, long timeout_sec,
-                      completion_ctx_t *cctx) {
+static int fill_slots(multi_session_t *session, VALUE requests, int *invalid,
+                      const request_options_t *opts, completion_ctx_t *cctx) {
     while (session->active_count < session->max_connections) {
         int idx = next_pending_index(session);
         if (idx < 0)
@@ -813,11 +1081,14 @@ static int fill_slots(multi_session_t *session, VALUE requests, int *invalid, lo
 
         request_ctx_t *ctx = &session->requests[idx];
 
-        if (!activate_request(session, requests, idx, invalid, timeout_sec)) {
+        if (!activate_request(session, requests, idx, invalid, opts)) {
             invalid[idx] = 1;
             ctx->done = 1;
             ctx->active = 0;
-            if (record_immediate_error(cctx, idx, "Invalid request configuration"))
+            if (record_immediate_error(cctx, idx,
+                                       ctx->setup_error ? ctx->setup_error
+                                                        : "Invalid request configuration",
+                                       ctx->attempts))
                 return 1;
         }
     }
@@ -838,13 +1109,14 @@ static void prepare_pending(multi_session_t *session, int *indices, int count) {
 }
 
 static void run_multi_loop(multi_session_t *session, completion_ctx_t *cctx, VALUE requests,
-                           int *invalid, long timeout_sec, int *indices, int indices_count) {
+                           int *invalid, const request_options_t *opts, int *indices,
+                           int indices_count) {
 #ifdef FAST_CURL_HAVE_FIBER_SCHEDULER
     VALUE scheduler = current_fiber_scheduler();
 #endif
     prepare_pending(session, indices, indices_count);
 
-    if (fill_slots(session, requests, invalid, timeout_sec, cctx))
+    if (fill_slots(session, requests, invalid, opts, cctx))
         return;
 
     curl_multi_perform(session->multi, &session->still_running);
@@ -852,7 +1124,10 @@ static void run_multi_loop(multi_session_t *session, completion_ctx_t *cctx, VAL
         return;
 
     while (!session->cancelled && (session->active_count > 0 || pending_remaining(session))) {
-        if (fill_slots(session, requests, invalid, timeout_sec, cctx))
+        if (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms)
+            break;
+
+        if (fill_slots(session, requests, invalid, opts, cctx))
             return;
 
         if (session->active_count == 0)
@@ -880,6 +1155,9 @@ static int is_default_retryable_curle(CURLcode code) {
 }
 
 static int should_retry(request_ctx_t *ctx, retry_config_t *rc) {
+    if (!ctx->idempotent && !rc->retry_non_idempotent)
+        return 0;
+
     if (ctx->curl_result != CURLE_OK)
         return is_default_retryable_curle(ctx->curl_result);
 
@@ -930,6 +1208,26 @@ static void retry_config_init(retry_config_t *retry_cfg) {
     retry_cfg->retry_delay_ms = DEFAULT_RETRY_DELAY;
     retry_cfg->retry_http_codes = NULL;
     retry_cfg->retry_http_count = 0;
+    retry_cfg->retry_non_idempotent = 0;
+}
+
+static long retry_backoff_ms(const retry_config_t *rc, int attempt) {
+    long delay = rc->retry_delay_ms;
+    long half;
+
+    if (delay <= 0)
+        return 0;
+
+    for (int i = 0; i < attempt && delay < MAX_RETRY_DELAY_MS; i++)
+        delay *= 2;
+    if (delay > MAX_RETRY_DELAY_MS)
+        delay = MAX_RETRY_DELAY_MS;
+
+    half = delay / 2;
+    if (half > 0)
+        delay = half + (long)(fast_rand() % (uint32_t)(half + 1));
+
+    return delay;
 }
 
 static long parse_long_option(VALUE options, key_id_t key, const char *name, long min, long max,
@@ -986,8 +1284,16 @@ static void parse_retry_codes(VALUE options, retry_config_t *retry_cfg) {
         retry_cfg->retry_http_codes[i] = NUM2INT(rb_ary_entry(codes, i));
 }
 
-static void parse_options(VALUE options, long *timeout, int *max_conn, retry_config_t *retry_cfg) {
-    *timeout = 30;
+static void parse_options(VALUE options, request_options_t *opts, int *max_conn,
+                          retry_config_t *retry_cfg) {
+    VALUE flag;
+
+    opts->timeout_sec = 30;
+    opts->connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS;
+    opts->total_timeout_ms = 0;
+    opts->follow_redirects = 1;
+    opts->max_redirects = MAX_REDIRECTS;
+    opts->deadline_ms = 0;
     *max_conn = 20;
     retry_config_init(retry_cfg);
 
@@ -995,7 +1301,24 @@ static void parse_options(VALUE options, long *timeout, int *max_conn, retry_con
         return;
 
     Check_Type(options, T_HASH);
-    *timeout = parse_long_option(options, KEY_TIMEOUT, "timeout", 1, MAX_TIMEOUT, *timeout, NULL);
+    opts->timeout_sec =
+        parse_long_option(options, KEY_TIMEOUT, "timeout", 1, MAX_TIMEOUT, opts->timeout_sec, NULL);
+    opts->connect_timeout_ms =
+        parse_long_option(options, KEY_CONNECT_TIMEOUT, "connect_timeout", 1,
+                          MAX_CONNECT_TIMEOUT_MS, opts->connect_timeout_ms, NULL);
+    opts->total_timeout_ms = parse_long_option(options, KEY_TOTAL_TIMEOUT, "total_timeout", 1,
+                                               MAX_TOTAL_TIMEOUT_MS, opts->total_timeout_ms, NULL);
+    opts->max_redirects = parse_long_option(options, KEY_MAX_REDIRECTS, "max_redirects", 0, 100,
+                                            opts->max_redirects, NULL);
+
+    flag = hash_aref_key(options, KEY_FOLLOW_REDIRECTS);
+    if (!NIL_P(flag))
+        opts->follow_redirects = RTEST(flag) ? 1L : 0L;
+
+    flag = hash_aref_key(options, KEY_RETRY_NON_IDEMPOTENT);
+    if (!NIL_P(flag))
+        retry_cfg->retry_non_idempotent = RTEST(flag) ? 1 : 0;
+
     *max_conn = parse_int_option(options, KEY_CONNECTIONS, "connections", 1, MAX_CONNECTIONS,
                                  *max_conn, NULL);
     retry_cfg->max_retries = parse_int_option(options, KEY_RETRIES, "retries", 0, MAX_RETRIES,
@@ -1074,7 +1397,7 @@ typedef struct {
     multi_session_t *session;
     int *invalid;
     retry_config_t *retry_cfg;
-    long timeout_sec;
+    request_options_t *opts;
 } execute_args_t;
 
 static VALUE internal_execute_body(VALUE arg) {
@@ -1083,7 +1406,8 @@ static VALUE internal_execute_body(VALUE arg) {
     multi_session_t *session = ea->session;
     int *invalid = ea->invalid;
     retry_config_t *retry_cfg = ea->retry_cfg;
-    long timeout_sec = ea->timeout_sec;
+    request_options_t *opts = ea->opts;
+    int deadline_hit = 0;
     int count = session->count;
     int target = ea->target;
     int stream = ea->stream;
@@ -1102,10 +1426,18 @@ static VALUE internal_execute_body(VALUE arg) {
             rb_ary_store(cctx.results, i, Qnil);
     }
 
-    run_multi_loop(session, &cctx, requests, invalid, timeout_sec, NULL, count);
+    if (opts->total_timeout_ms > 0)
+        opts->deadline_ms = fast_now_ms() + opts->total_timeout_ms;
+
+    run_multi_loop(session, &cctx, requests, invalid, opts, NULL, count);
 
     if (!stream && target <= 0 && retry_cfg->max_retries > 0) {
         for (int attempt = 0; attempt < retry_cfg->max_retries; attempt++) {
+            if (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms) {
+                deadline_hit = 1;
+                break;
+            }
+
             int *retry_indices = malloc(sizeof(int) * (size_t)count);
             if (!retry_indices)
                 rb_raise(rb_eNoMemError, "failed to allocate retry index array");
@@ -1123,7 +1455,18 @@ static VALUE internal_execute_body(VALUE arg) {
                 break;
             }
 
-            retry_delay_sleep(retry_cfg->retry_delay_ms);
+            long backoff = retry_backoff_ms(retry_cfg, attempt);
+            if (opts->deadline_ms > 0) {
+                long long left = opts->deadline_ms - fast_now_ms();
+                if (left <= 0) {
+                    deadline_hit = 1;
+                    free(retry_indices);
+                    break;
+                }
+                if (backoff > (long)left)
+                    backoff = (long)left;
+            }
+            retry_delay_sleep(backoff);
 
             int runnable_count = 0;
             for (int r = 0; r < retry_count; r++) {
@@ -1133,6 +1476,7 @@ static VALUE internal_execute_body(VALUE arg) {
                 if (!request_ctx_reset_for_retry(rc)) {
                     invalid[idx] = 1;
                     rc->done = 1;
+                    rc->setup_error = "Failed to allocate a curl handle for the retry";
                     continue;
                 }
 
@@ -1141,7 +1485,7 @@ static VALUE internal_execute_body(VALUE arg) {
 
             if (runnable_count > 0) {
                 cctx.completed = 0;
-                run_multi_loop(session, &cctx, requests, invalid, timeout_sec, retry_indices,
+                run_multi_loop(session, &cctx, requests, invalid, opts, retry_indices,
                                runnable_count);
             }
 
@@ -1155,14 +1499,20 @@ static VALUE internal_execute_body(VALUE arg) {
             VALUE response;
 
             if (invalid[i]) {
-                response = build_error_response("Invalid request configuration");
+                response = build_error_response(rc->setup_error ? rc->setup_error
+                                                                : "Invalid request configuration",
+                                                ERR_INVALID_REQUEST, rc->attempts);
             } else if (!rc->done) {
-                response = build_error_response("Request was not completed");
+                response =
+                    deadline_hit || (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms)
+                        ? build_error_response("Total timeout exceeded", ERR_DEADLINE, rc->attempts)
+                        : build_error_response("Request was not completed", ERR_NOT_COMPLETED,
+                                               rc->attempts);
             } else if (rc->curl_result == CURLE_OK) {
                 response = build_response(rc);
             } else {
                 response = build_error_response_with_code(curl_easy_strerror(rc->curl_result),
-                                                          (int)rc->curl_result);
+                                                          (int)rc->curl_result, rc->attempts);
             }
 
             rb_ary_store(cctx.results, i, build_result_pair(i, response));
@@ -1262,10 +1612,31 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
     if (target > 0 && target > count)
         target = count;
 
-    long timeout_sec;
+    request_options_t opts;
     int max_conn;
     retry_config_t retry_cfg;
-    parse_options(options, &timeout_sec, &max_conn, &retry_cfg);
+    parse_options(options, &opts, &max_conn, &retry_cfg);
+
+    for (int i = 0; i < count; i++) {
+        request_ctx_t probe;
+        request_ctx_init(&probe, i);
+        if (!request_ctx_prepare_easy(&probe)) {
+            request_ctx_free(&probe);
+            continue;
+        }
+        setup_easy_handle(&probe, rb_ary_entry(requests, i), &opts);
+        int fatal = probe.setup_error_fatal;
+        const char *message = probe.setup_error;
+        char buffer[128];
+        if (fatal && message) {
+            snprintf(buffer, sizeof(buffer), "%s (request %d)", message, i);
+        }
+        request_ctx_free(&probe);
+        if (fatal) {
+            VALUE klass = NIL_P(fast_validation_error) ? rb_eArgError : fast_validation_error;
+            rb_raise(klass, "%s", buffer);
+        }
+    }
 
     if (stream || target > 0) {
         if (retry_cfg.retries_explicit && retry_cfg.max_retries > 0 && stream)
@@ -1279,7 +1650,7 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
 
     multi_session_t session;
     int *invalid = NULL;
-    multi_session_init(&session, curl_multi_init(), count, max_conn, timeout_sec);
+    multi_session_init(&session, curl_multi_init(), count, max_conn, opts.timeout_sec);
 
     cleanup_ctx_t cleanup = {.session = &session, .invalid = NULL, .retry_cfg = &retry_cfg};
 
@@ -1304,7 +1675,7 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
         .session = &session,
         .invalid = invalid,
         .retry_cfg = &retry_cfg,
-        .timeout_sec = timeout_sec,
+        .opts = &opts,
     };
 
 #ifdef FAST_CURL_HAVE_FIBER_SCHEDULER
@@ -1326,7 +1697,6 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
                          (VALUE)&cleanup);
     }
 #endif
-
     return rb_ensure(internal_execute_body, (VALUE)&ea, cleanup_session, (VALUE)&cleanup);
 }
 
@@ -1366,6 +1736,7 @@ static VALUE rb_fast_curl_stream_execute(int argc, VALUE *argv, VALUE self) {
 
 void Init_fast_curl(void) {
     curl_global_init(CURL_GLOBAL_ALL);
+    fast_share_init();
 
     for (int i = 0; i < KEY_LAST; i++) {
         fast_ids[i] = rb_intern(KEY_NAMES[i]);
@@ -1373,7 +1744,17 @@ void Init_fast_curl(void) {
         rb_gc_register_address(&fast_syms[i]);
     }
 
+    for (int i = 0; i < ERR_LAST; i++) {
+        error_syms[i] = ID2SYM(rb_intern(ERROR_KIND_NAMES[i]));
+        rb_gc_register_address(&error_syms[i]);
+    }
+
     VALUE mFastCurl = rb_define_module("FastCurl");
+
+    if (rb_const_defined_at(mFastCurl, rb_intern("Headers"))) {
+        fast_cHeaders = rb_const_get_at(mFastCurl, rb_intern("Headers"));
+        rb_gc_register_address(&fast_cHeaders);
+    }
 
     rb_define_module_function(mFastCurl, "execute", rb_fast_curl_execute, -1);
     rb_define_module_function(mFastCurl, "first_execute", rb_fast_curl_first_execute, -1);
