@@ -8,6 +8,7 @@ Ultra-fast parallel HTTP client for Ruby. C extension built on libcurl `curl_mul
 - **GVL release** — `rb_thread_call_without_gvl` during I/O, other Ruby threads keep running
 - **Fiber scheduler compatible** — works inside `Async do ... end` without blocking other fibers
 - **Three modes**: execute (all), first_execute (first N), stream_execute (yield as ready)
+- **Lazy Enumerable sources** — bounded request preparation for large or infinite streams
 - **Zero dependencies** — only libcurl (available everywhere)
 
 ## Installation
@@ -81,6 +82,34 @@ Query parameters can be passed separately:
 FastCurl.get([{ url: "https://api.example.com/search", params: { q: "ruby", page: 2 } }])
 ```
 
+### Lazy / bounded Enumerable sources
+
+`Array` keeps the existing fast path. Any other object responding to `#each` is
+consumed lazily, so large request sets do not need to be materialized first:
+
+```ruby
+requests = Enumerator.new do |y|
+  1_000_000.times do |i|
+    y << { url: "https://api.example.com/items/#{i}" }
+  end
+end
+
+FastCurl.stream_get(requests, connections: 20, buffer: 20) do |index, response|
+  puts "#{index}: #{response[:status]}"
+end
+```
+
+For lazy sources, at most `connections + buffer` requests are retained by
+`fast_curl`. The source itself may have produced one additional item before
+backpressure is applied, so a generator can observe a maximum look-ahead of
+`connections + buffer + 1`. `buffer` defaults to `connections`.
+
+`FastCurl.get` still returns all results in input order, so its result array is
+necessarily O(N). Use `stream_get` when the whole pipeline must stay bounded.
+Source exceptions and stream callback exceptions unwind the native multi loop
+and release active curl handles; an `ensure` in the source is also unwound on
+early completed `first_*` calls.
+
 ### First N responses (cancel the rest)
 
 ```ruby
@@ -90,6 +119,19 @@ result = FastCurl.first_get([
   { url: "https://mirror3.example.com/file" }
 ], count: 1)
 ```
+
+`accept:` can keep the race running until a response satisfies a predicate:
+
+```ruby
+result = FastCurl.first_get(
+  mirrors,
+  connections: 3,
+  accept: ->(response) { response[:status].between?(200, 299) }
+)
+```
+
+The predicate receives the response Hash. Rejected responses do not count
+toward `count`.
 
 ### Stream responses as they arrive
 
@@ -195,6 +237,7 @@ folded and is **always** an Array, even for a single cookie.
 | Option | Default | Description |
 |---|---|---|
 | `connections` | 20 | Max parallel connections |
+| `buffer` | `connections` | Lazy-source prefetch window; ignored for already-materialized Arrays |
 | `timeout` | 30 | Timeout for a single attempt, in seconds (1-300) |
 | `connect_timeout` | 10000 | Connection phase timeout, in milliseconds |
 | `total_timeout` | none | Wall-clock budget for the whole call, in milliseconds |
@@ -204,6 +247,7 @@ folded and is **always** an Array, even for a single cookie.
 | `retry_non_idempotent` | false | Also retry POST and PATCH |
 | `follow_redirects` | true | Follow `Location` headers |
 | `max_redirects` | 5 | Redirect limit (0-100) |
+| `accept` | none | `first_*` predicate receiving the response Hash |
 
 DNS results and TLS sessions are cached process-wide, so repeated calls to the
 same host skip resolution and can resume TLS. TCP connections are pooled only

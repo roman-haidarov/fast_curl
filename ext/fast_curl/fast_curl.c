@@ -32,6 +32,7 @@
 #define MAX_RETRIES                10
 #define MAX_REQUESTS               10000
 #define MAX_CONNECTIONS            100
+#define MAX_BUFFER                 10000
 #define MAX_RETRY_DELAY_MS         30000
 #define DEFAULT_RETRIES            1
 #define DEFAULT_RETRY_DELAY        100
@@ -72,6 +73,8 @@ typedef enum {
     KEY_EFFECTIVE_URL,
     KEY_ERROR,
     KEY_ATTEMPTS,
+    KEY_BUFFER,
+    KEY_ACCEPT,
     KEY_LAST
 } key_id_t;
 
@@ -101,6 +104,8 @@ static const char *const KEY_NAMES[KEY_LAST] = {
     "effective_url",
     "error",
     "attempts",
+    "buffer",
+    "accept",
 };
 
 typedef enum {
@@ -320,7 +325,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
 
 typedef struct {
     CURL *easy;
-    int index;
+    long index;
     buffer_t body;
     header_list_t headers;
     struct curl_slist *req_headers;
@@ -341,7 +346,7 @@ static VALUE fast_validation_error = Qnil;
         (ctx)->setup_error_fatal = (fatal); \
     } while (0)
 
-static inline void request_ctx_init(request_ctx_t *ctx, int index) {
+static inline void request_ctx_init(request_ctx_t *ctx, long index) {
     ctx->easy = NULL;
     ctx->index = index;
     buffer_init(&ctx->body);
@@ -961,30 +966,52 @@ static void unblock_perform(void *arg) {
 
 typedef struct {
     VALUE results;
+    VALUE accept;
     int completed;
     int target;
     int stream;
 } completion_ctx_t;
 
-static VALUE build_result_pair(int index, VALUE response) {
-    return rb_ary_new_from_args(2, INT2NUM(index), response);
+static VALUE build_result_pair(long index, VALUE response) {
+    return rb_ary_new_from_args(2, LONG2NUM(index), response);
 }
 
-static int record_immediate_error(completion_ctx_t *cctx, int index, const char *message,
-                                  int attempts) {
-    if (cctx->stream || cctx->target > 0) {
-        VALUE pair =
-            build_result_pair(index, build_error_response(message, ERR_INVALID_REQUEST, attempts));
+static int response_accepted(completion_ctx_t *cctx, VALUE response) {
+    if (cctx->target <= 0 || NIL_P(cctx->accept))
+        return 1;
 
-        if (cctx->stream)
-            rb_yield(pair);
-        else
-            rb_ary_push(cctx->results, pair);
+    return RTEST(rb_funcall(cctx->accept, rb_intern("call"), 1, response));
+}
 
+static int record_response(completion_ctx_t *cctx, long index, VALUE response) {
+    VALUE pair = build_result_pair(index, response);
+
+    if (cctx->stream) {
+        rb_yield(pair);
         cctx->completed++;
-        if (cctx->target > 0 && cctx->completed >= cctx->target)
-            return 1;
+        return 0;
     }
+
+    if (cctx->target > 0) {
+        if (!response_accepted(cctx, response))
+            return 0;
+
+        rb_ary_push(cctx->results, pair);
+        cctx->completed++;
+        return cctx->completed >= cctx->target;
+    }
+
+    rb_ary_store(cctx->results, index, pair);
+    cctx->completed++;
+    return 0;
+}
+
+static int record_immediate_error(completion_ctx_t *cctx, long index, const char *message,
+                                  int attempts) {
+    if (cctx->stream || cctx->target > 0)
+        return record_response(cctx, index,
+                               build_error_response(message, ERR_INVALID_REQUEST, attempts));
+
     return 0;
 }
 
@@ -1019,17 +1046,11 @@ static int process_completed(multi_session_t *session, completion_ctx_t *cctx) {
                     ? build_response(ctx)
                     : build_error_response_with_code(curl_easy_strerror(msg->data.result),
                                                      (int)msg->data.result, ctx->attempts);
-            VALUE pair = build_result_pair(ctx->index, response);
-
-            if (cctx->stream)
-                rb_yield(pair);
-            else
-                rb_ary_push(cctx->results, pair);
+            if (record_response(cctx, ctx->index, response))
+                return 1;
+        } else {
+            cctx->completed++;
         }
-
-        cctx->completed++;
-        if (cctx->target > 0 && cctx->completed >= cctx->target)
-            return 1;
     }
 
     return 0;
@@ -1417,9 +1438,13 @@ static VALUE internal_execute_body(VALUE arg) {
 
     completion_ctx_t cctx;
     cctx.results = stream ? Qnil : ((target > 0) ? rb_ary_new2(target) : rb_ary_new2(count));
+    cctx.accept = target > 0 && !NIL_P(ea->options) ? hash_aref_key(ea->options, KEY_ACCEPT) : Qnil;
     cctx.completed = 0;
     cctx.target = target;
     cctx.stream = stream;
+
+    if (!NIL_P(cctx.accept) && !rb_respond_to(cctx.accept, rb_intern("call")))
+        rb_raise(rb_eArgError, "accept must respond to #call");
 
     if (!stream && target <= 0) {
         for (int i = 0; i < count; i++)
@@ -1522,6 +1547,482 @@ static VALUE internal_execute_body(VALUE arg) {
     return stream ? Qnil : cctx.results;
 }
 
+typedef enum {
+    LAZY_SLOT_FREE,
+    LAZY_SLOT_PENDING,
+    LAZY_SLOT_ACTIVE,
+    LAZY_SLOT_RETRY_WAIT
+} lazy_slot_state_t;
+
+typedef struct {
+    multi_session_t session;
+    request_options_t opts;
+    retry_config_t retry_cfg;
+    completion_ctx_t cctx;
+    VALUE source;
+    VALUE anchors;
+    int *states;
+    int *free_slots;
+    int free_count;
+    int *pending_slots;
+    int pending_head;
+    int pending_tail;
+    int pending_count;
+    long long *retry_at_ms;
+    int capacity;
+    int buffer_size;
+    int occupied_count;
+    long next_index;
+    int deadline_hit;
+    int stop;
+} lazy_execute_ctx_t;
+
+static int lazy_pending_push(lazy_execute_ctx_t *ctx, int slot) {
+    if (ctx->pending_count >= ctx->capacity)
+        return 0;
+
+    ctx->pending_slots[ctx->pending_tail] = slot;
+    ctx->pending_tail = (ctx->pending_tail + 1) % ctx->capacity;
+    ctx->pending_count++;
+    return 1;
+}
+
+static int lazy_pending_pop(lazy_execute_ctx_t *ctx) {
+    if (ctx->pending_count == 0)
+        return -1;
+
+    int slot = ctx->pending_slots[ctx->pending_head];
+    ctx->pending_head = (ctx->pending_head + 1) % ctx->capacity;
+    ctx->pending_count--;
+    return slot;
+}
+
+static void lazy_release_slot(lazy_execute_ctx_t *ctx, int slot) {
+    request_ctx_free(&ctx->session.requests[slot]);
+    rb_ary_store(ctx->anchors, slot, Qnil);
+    ctx->states[slot] = LAZY_SLOT_FREE;
+    ctx->retry_at_ms[slot] = 0;
+    ctx->free_slots[ctx->free_count++] = slot;
+    if (ctx->occupied_count > 0)
+        ctx->occupied_count--;
+}
+
+static FAST_CURL_NORETURN void lazy_raise_setup_error(request_ctx_t *request) {
+    VALUE klass = NIL_P(fast_validation_error) ? rb_eArgError : fast_validation_error;
+    rb_raise(klass, "%s (request %ld)",
+             request->setup_error ? request->setup_error : "Invalid request configuration",
+             request->index);
+}
+
+static int lazy_finalize_error(lazy_execute_ctx_t *ctx, int slot, const char *message) {
+    request_ctx_t *request = &ctx->session.requests[slot];
+    VALUE response = build_error_response(message, ERR_INVALID_REQUEST, request->attempts);
+    int stop = record_response(&ctx->cctx, request->index, response);
+    lazy_release_slot(ctx, slot);
+    return stop;
+}
+
+static int lazy_activate_pending(lazy_execute_ctx_t *ctx) {
+    while (ctx->session.active_count < ctx->session.max_connections && ctx->pending_count > 0) {
+        int slot = lazy_pending_pop(ctx);
+        request_ctx_t *request = &ctx->session.requests[slot];
+        VALUE request_value = rb_ary_entry(ctx->anchors, slot);
+
+        if (!request_ctx_prepare_easy(request)) {
+            if (lazy_finalize_error(ctx, slot, "Failed to allocate a curl handle"))
+                return 1;
+            continue;
+        }
+
+        if (!setup_easy_handle(request, request_value, &ctx->opts)) {
+            if (request->setup_error_fatal)
+                lazy_raise_setup_error(request);
+            if (lazy_finalize_error(ctx, slot,
+                                    request->setup_error ? request->setup_error
+                                                         : "Invalid request configuration"))
+                return 1;
+            continue;
+        }
+
+        if (curl_multi_add_handle(ctx->session.multi, request->easy) != CURLM_OK) {
+            if (lazy_finalize_error(ctx, slot, "Failed to schedule the request"))
+                return 1;
+            continue;
+        }
+
+        request->attempts++;
+        request->active = 1;
+        request->done = 0;
+        ctx->states[slot] = LAZY_SLOT_ACTIVE;
+        ctx->session.active_count++;
+    }
+
+    return 0;
+}
+
+static int lazy_activate_retries(lazy_execute_ctx_t *ctx) {
+    long long now = fast_now_ms();
+
+    for (int slot = 0;
+         slot < ctx->capacity && ctx->session.active_count < ctx->session.max_connections; slot++) {
+        if (ctx->states[slot] != LAZY_SLOT_RETRY_WAIT || ctx->retry_at_ms[slot] > now)
+            continue;
+
+        request_ctx_t *request = &ctx->session.requests[slot];
+        VALUE request_value = rb_ary_entry(ctx->anchors, slot);
+
+        if (!request_ctx_reset_for_retry(request)) {
+            if (lazy_finalize_error(ctx, slot, "Failed to allocate a curl handle for the retry"))
+                return 1;
+            continue;
+        }
+
+        if (!setup_easy_handle(request, request_value, &ctx->opts)) {
+            if (request->setup_error_fatal)
+                lazy_raise_setup_error(request);
+            if (lazy_finalize_error(ctx, slot,
+                                    request->setup_error ? request->setup_error
+                                                         : "Invalid request configuration"))
+                return 1;
+            continue;
+        }
+
+        if (curl_multi_add_handle(ctx->session.multi, request->easy) != CURLM_OK) {
+            if (lazy_finalize_error(ctx, slot, "Failed to schedule the retry"))
+                return 1;
+            continue;
+        }
+
+        request->attempts++;
+        request->active = 1;
+        request->done = 0;
+        ctx->states[slot] = LAZY_SLOT_ACTIVE;
+        ctx->retry_at_ms[slot] = 0;
+        ctx->session.active_count++;
+    }
+
+    return 0;
+}
+
+static long long lazy_next_retry_at(const lazy_execute_ctx_t *ctx) {
+    long long next = 0;
+    for (int slot = 0; slot < ctx->capacity; slot++) {
+        if (ctx->states[slot] != LAZY_SLOT_RETRY_WAIT)
+            continue;
+        if (next == 0 || ctx->retry_at_ms[slot] < next)
+            next = ctx->retry_at_ms[slot];
+    }
+    return next;
+}
+
+static int lazy_process_completed(lazy_execute_ctx_t *ctx) {
+    CURLMsg *msg;
+    int msgs_left;
+
+    while ((msg = curl_multi_info_read(ctx->session.multi, &msgs_left))) {
+        if (msg->msg != CURLMSG_DONE)
+            continue;
+
+        request_ctx_t *request = NULL;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&request);
+        if (!request || request->done)
+            continue;
+
+        int slot = (int)(request - ctx->session.requests);
+        if (slot < 0 || slot >= ctx->capacity)
+            continue;
+
+        if (request->active) {
+            curl_multi_remove_handle(ctx->session.multi, request->easy);
+            request->active = 0;
+            if (ctx->session.active_count > 0)
+                ctx->session.active_count--;
+        }
+
+        request->done = 1;
+        request->curl_result = msg->data.result;
+        if (msg->data.result == CURLE_OK)
+            curl_easy_getinfo(request->easy, CURLINFO_RESPONSE_CODE, &request->http_status);
+
+        if (request->attempts <= ctx->retry_cfg.max_retries &&
+            should_retry(request, &ctx->retry_cfg)) {
+            ctx->states[slot] = LAZY_SLOT_RETRY_WAIT;
+            ctx->retry_at_ms[slot] =
+                fast_now_ms() + retry_backoff_ms(&ctx->retry_cfg, request->attempts - 1);
+            continue;
+        }
+
+        VALUE response =
+            (msg->data.result == CURLE_OK)
+                ? build_response(request)
+                : build_error_response_with_code(curl_easy_strerror(msg->data.result),
+                                                 (int)msg->data.result, request->attempts);
+        int stop = record_response(&ctx->cctx, request->index, response);
+        lazy_release_slot(ctx, slot);
+        if (stop)
+            return 1;
+    }
+
+    return 0;
+}
+
+typedef struct {
+    multi_session_t *session;
+    long long wake_at_ms;
+} lazy_poll_args_t;
+
+static void *lazy_poll_without_gvl(void *arg) {
+    lazy_poll_args_t *poll = (lazy_poll_args_t *)arg;
+    multi_session_t *session = poll->session;
+    long long started = fast_now_ms();
+    int before = session->still_running;
+
+    while (!session->cancelled) {
+        int numfds = 0;
+        curl_multi_poll(session->multi, NULL, 0, POLL_TIMEOUT_MS, &numfds);
+        curl_multi_perform(session->multi, &session->still_running);
+
+        if (session->still_running == 0 || session->still_running < before)
+            break;
+        if (poll->wake_at_ms > 0 && fast_now_ms() >= poll->wake_at_ms)
+            break;
+        if (fast_now_ms() - started >= POLL_SLICE_MS)
+            break;
+    }
+
+    return NULL;
+}
+
+static void lazy_wait(lazy_execute_ctx_t *ctx) {
+    long long next_retry = lazy_next_retry_at(ctx);
+
+    if (ctx->session.active_count > 0) {
+        lazy_poll_args_t poll = {.session = &ctx->session, .wake_at_ms = next_retry};
+#ifdef FAST_CURL_HAVE_FIBER_SCHEDULER
+        VALUE scheduler = current_fiber_scheduler();
+        if (scheduler != Qnil)
+            run_via_fiber_worker(scheduler, lazy_poll_without_gvl, &poll);
+        else
+#endif
+            rb_thread_call_without_gvl(lazy_poll_without_gvl, &poll, unblock_perform,
+                                       &ctx->session);
+        return;
+    }
+
+    if (next_retry > 0) {
+        long long delay = next_retry - fast_now_ms();
+        if (delay > 0)
+            retry_delay_sleep((long)delay);
+    }
+}
+
+static int lazy_deadline_reached(lazy_execute_ctx_t *ctx) {
+    if (ctx->opts.deadline_ms <= 0 || fast_now_ms() < ctx->opts.deadline_ms)
+        return 0;
+
+    ctx->deadline_hit = 1;
+    ctx->stop = 1;
+    return 1;
+}
+
+static void lazy_progress(lazy_execute_ctx_t *ctx) {
+    if (ctx->stop || lazy_deadline_reached(ctx))
+        return;
+
+    if (lazy_activate_retries(ctx) || lazy_activate_pending(ctx)) {
+        ctx->stop = 1;
+        return;
+    }
+
+    curl_multi_perform(ctx->session.multi, &ctx->session.still_running);
+    if (lazy_process_completed(ctx)) {
+        ctx->stop = 1;
+        return;
+    }
+
+    if (ctx->occupied_count == 0)
+        return;
+
+    lazy_wait(ctx);
+    if (lazy_process_completed(ctx))
+        ctx->stop = 1;
+}
+
+static VALUE lazy_each_request(VALUE yielded, VALUE arg, int argc, const VALUE *argv,
+                               VALUE blockarg) {
+    (void)blockarg;
+    lazy_execute_ctx_t *ctx = (lazy_execute_ctx_t *)arg;
+    VALUE request = argc == 1 ? argv[0] : yielded;
+
+    while (!ctx->stop && ctx->occupied_count >= ctx->capacity)
+        lazy_progress(ctx);
+
+    if (ctx->stop || lazy_deadline_reached(ctx))
+        rb_iter_break();
+
+    if (ctx->next_index > INT_MAX)
+        rb_raise(rb_eArgError, "lazy request index exceeds supported range");
+
+    int slot = ctx->free_slots[--ctx->free_count];
+    request_ctx_init(&ctx->session.requests[slot], ctx->next_index++);
+    rb_ary_store(ctx->anchors, slot, request);
+    ctx->states[slot] = LAZY_SLOT_PENDING;
+    ctx->occupied_count++;
+    lazy_pending_push(ctx, slot);
+
+    if (lazy_activate_retries(ctx) || lazy_activate_pending(ctx)) {
+        ctx->stop = 1;
+        rb_iter_break();
+    }
+
+    curl_multi_perform(ctx->session.multi, &ctx->session.still_running);
+    if (lazy_process_completed(ctx)) {
+        ctx->stop = 1;
+        rb_iter_break();
+    }
+
+    return Qnil;
+}
+
+static void lazy_finalize_deadline(lazy_execute_ctx_t *ctx) {
+    if (ctx->cctx.stream || ctx->cctx.target > 0)
+        return;
+
+    for (int slot = 0; slot < ctx->capacity; slot++) {
+        if (ctx->states[slot] == LAZY_SLOT_FREE)
+            continue;
+
+        request_ctx_t *request = &ctx->session.requests[slot];
+        if (request->active) {
+            curl_multi_remove_handle(ctx->session.multi, request->easy);
+            request->active = 0;
+            if (ctx->session.active_count > 0)
+                ctx->session.active_count--;
+        }
+
+        VALUE response =
+            build_error_response("Total timeout exceeded", ERR_DEADLINE, request->attempts);
+        record_response(&ctx->cctx, request->index, response);
+        lazy_release_slot(ctx, slot);
+    }
+}
+
+static VALUE lazy_execute_body(VALUE arg) {
+    lazy_execute_ctx_t *ctx = (lazy_execute_ctx_t *)arg;
+
+    if (ctx->opts.total_timeout_ms > 0)
+        ctx->opts.deadline_ms = fast_now_ms() + ctx->opts.total_timeout_ms;
+
+    rb_block_call(ctx->source, rb_intern("each"), 0, NULL, lazy_each_request, (VALUE)ctx);
+
+    while (!ctx->stop && ctx->occupied_count > 0)
+        lazy_progress(ctx);
+
+    if (ctx->deadline_hit)
+        lazy_finalize_deadline(ctx);
+
+    RB_GC_GUARD(ctx->source);
+    RB_GC_GUARD(ctx->anchors);
+    return ctx->cctx.stream ? Qnil : ctx->cctx.results;
+}
+
+static VALUE cleanup_lazy_execute(VALUE arg) {
+    lazy_execute_ctx_t *ctx = (lazy_execute_ctx_t *)arg;
+
+    if (ctx->session.requests) {
+        for (int slot = 0; slot < ctx->capacity; slot++) {
+            request_ctx_t *request = &ctx->session.requests[slot];
+            if (request->easy && request->active && ctx->session.multi)
+                curl_multi_remove_handle(ctx->session.multi, request->easy);
+            request_ctx_free(request);
+        }
+        free(ctx->session.requests);
+        ctx->session.requests = NULL;
+    }
+
+    free(ctx->states);
+    ctx->states = NULL;
+    free(ctx->free_slots);
+    ctx->free_slots = NULL;
+    free(ctx->pending_slots);
+    ctx->pending_slots = NULL;
+    free(ctx->retry_at_ms);
+    ctx->retry_at_ms = NULL;
+
+    if (ctx->session.multi) {
+        curl_multi_cleanup(ctx->session.multi);
+        ctx->session.multi = NULL;
+    }
+
+    if (ctx->retry_cfg.retry_http_codes) {
+        free(ctx->retry_cfg.retry_http_codes);
+        ctx->retry_cfg.retry_http_codes = NULL;
+    }
+
+    return Qnil;
+}
+
+static VALUE internal_lazy_execute(VALUE requests, VALUE options, int target, int stream) {
+    if (!rb_respond_to(requests, rb_intern("each")))
+        rb_raise(rb_eArgError, "requests must be an Array or respond to #each");
+
+    lazy_execute_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    int max_conn;
+    parse_options(options, &ctx.opts, &max_conn, &ctx.retry_cfg);
+    ctx.buffer_size = NIL_P(options) ? max_conn
+                                     : parse_int_option(options, KEY_BUFFER, "buffer", 1,
+                                                        MAX_BUFFER, max_conn, NULL);
+
+    if (stream || target > 0) {
+        if (ctx.retry_cfg.retries_explicit && ctx.retry_cfg.max_retries > 0 && stream)
+            rb_warn(
+                "FastCurl: retries are not supported in stream_execute, ignoring retries option");
+        if (ctx.retry_cfg.retries_explicit && ctx.retry_cfg.max_retries > 0 && target > 0)
+            rb_warn(
+                "FastCurl: retries are not supported in first_execute, ignoring retries option");
+        ctx.retry_cfg.max_retries = 0;
+    }
+
+    ctx.capacity = max_conn + ctx.buffer_size;
+    ctx.source = requests;
+    ctx.anchors = rb_ary_new2(ctx.capacity);
+    ctx.next_index = 0;
+
+    ctx.cctx.results = stream ? Qnil : rb_ary_new();
+    ctx.cctx.accept = target > 0 && !NIL_P(options) ? hash_aref_key(options, KEY_ACCEPT) : Qnil;
+    ctx.cctx.completed = 0;
+    ctx.cctx.target = target;
+    ctx.cctx.stream = stream;
+
+    if (!NIL_P(ctx.cctx.accept) && !rb_respond_to(ctx.cctx.accept, rb_intern("call")))
+        rb_raise(rb_eArgError, "accept must respond to #call");
+
+    multi_session_init(&ctx.session, curl_multi_init(), ctx.capacity, max_conn,
+                       ctx.opts.timeout_sec);
+    if (!ctx.session.multi)
+        rb_raise(rb_eNoMemError, "failed to initialize curl multi handle");
+    multi_session_configure(ctx.session.multi, max_conn);
+
+    ctx.session.requests = calloc((size_t)ctx.capacity, sizeof(request_ctx_t));
+    ctx.states = calloc((size_t)ctx.capacity, sizeof(int));
+    ctx.free_slots = malloc(sizeof(int) * (size_t)ctx.capacity);
+    ctx.pending_slots = malloc(sizeof(int) * (size_t)ctx.capacity);
+    ctx.retry_at_ms = calloc((size_t)ctx.capacity, sizeof(long long));
+
+    if (!ctx.session.requests || !ctx.states || !ctx.free_slots || !ctx.pending_slots ||
+        !ctx.retry_at_ms) {
+        cleanup_lazy_execute((VALUE)&ctx);
+        rb_raise(rb_eNoMemError, "failed to allocate lazy request state");
+    }
+
+    for (int slot = 0; slot < ctx.capacity; slot++)
+        ctx.free_slots[ctx.free_count++] = slot;
+
+    return rb_ensure(lazy_execute_body, (VALUE)&ctx, cleanup_lazy_execute, (VALUE)&ctx);
+}
+
 #ifdef FAST_CURL_HAVE_FIBER_SCHEDULER
 typedef struct {
     execute_args_t *ea;
@@ -1597,6 +2098,9 @@ static VALUE execute_with_fiber_scheduler(VALUE arg) {
 #endif
 
 static VALUE internal_execute(VALUE requests, VALUE options, int target, int stream) {
+    if (!RB_TYPE_P(requests, T_ARRAY))
+        return internal_lazy_execute(requests, options, target, stream);
+
     Check_Type(requests, T_ARRAY);
 
     long count_long = RARRAY_LEN(requests);
@@ -1616,6 +2120,12 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
     int max_conn;
     retry_config_t retry_cfg;
     parse_options(options, &opts, &max_conn, &retry_cfg);
+
+    if (target > 0 && !NIL_P(options)) {
+        VALUE accept = hash_aref_key(options, KEY_ACCEPT);
+        if (!NIL_P(accept) && !rb_respond_to(accept, rb_intern("call")))
+            rb_raise(rb_eArgError, "accept must respond to #call");
+    }
 
     for (int i = 0; i < count; i++) {
         request_ctx_t probe;
@@ -1680,7 +2190,8 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
 
 #ifdef FAST_CURL_HAVE_FIBER_SCHEDULER
     VALUE scheduler = current_fiber_scheduler();
-    if (scheduler != Qnil && !stream) {
+    VALUE accept = target > 0 && !NIL_P(options) ? hash_aref_key(options, KEY_ACCEPT) : Qnil;
+    if (scheduler != Qnil && !stream && NIL_P(accept)) {
         scheduler_execute_ctx_t scheduler_ctx = {
             .ea = &ea,
             .scheduler = scheduler,

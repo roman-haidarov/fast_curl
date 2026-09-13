@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-13
+
+### Added
+
+- Lazy `Enumerable` request sources for high-level helpers and raw
+  `execute`/`first_execute`/`stream_execute`. Non-Array sources are consumed
+  through a bounded native feeder instead of being materialized first.
+- `buffer` for lazy sources. The native window is bounded to
+  `connections + buffer`; a producer may have yielded one additional item while
+  waiting for capacity.
+- `accept:` for `first_*`/`first_execute`. Rejected responses do not count
+  toward `count`, and the source continues until enough responses are accepted
+  or it is exhausted.
+- Early `first_*` termination unwinds the source `#each`, so generator `ensure`
+  blocks run during cancellation.
+
+### Changed
+
+- Existing Array execution remains on the original pre-materialized fast path.
+  Lazy collect mode preserves input ordering and retry behavior; lazy
+  `stream_execute` and `first_execute` keep the existing no-retry semantics of
+  those modes.
+
 ## [0.4.0] - 2026-07-22
 
 ### Fixed

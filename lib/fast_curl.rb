@@ -88,7 +88,8 @@ module FastCurl
         execute(build_requests(requests, method), **DEFAULT_OPTIONS.merge(options))
       end
 
-      define_method(:"first_#{method}") do |requests, count: 1, **options|
+      define_method(:"first_#{method}") do |requests, count: 1, accept: nil, **options|
+        options[:accept] = accept unless accept.nil?
         first_execute(build_requests(requests, method), count: count, **DEFAULT_OPTIONS.merge(options))
       end
 
@@ -100,24 +101,38 @@ module FastCurl
     private
 
     def build_requests(requests, method)
-      requests.map do |req|
-        r = { url: build_url(req), method: method.to_s.upcase }
-        headers = req[:headers] ? req[:headers].dup : nil
+      source = requests.is_a?(Hash) ? [requests] : requests
 
-        if BODY_METHODS.include?(method)
-          body, content_type = build_body(req)
-          if body
-            r[:body] = body
-            if content_type && !content_type?(headers)
-              headers ||= {}
-              headers["Content-Type"] = content_type
-            end
+      if source.is_a?(Array)
+        source.map { |request| build_request(request, method) }
+      elsif source.respond_to?(:each)
+        Enumerator.new do |yielder|
+          source.each { |request| yielder << build_request(request, method) }
+        end
+      else
+        raise ArgumentError, "requests must be a Hash, Array or respond to #each"
+      end
+    end
+
+    def build_request(req, method)
+      raise ArgumentError, "request must be a Hash" unless req.is_a?(Hash)
+
+      r = { url: build_url(req), method: method.to_s.upcase }
+      headers = req[:headers] ? req[:headers].dup : nil
+
+      if BODY_METHODS.include?(method)
+        body, content_type = build_body(req)
+        if body
+          r[:body] = body
+          if content_type && !content_type?(headers)
+            headers ||= {}
+            headers["Content-Type"] = content_type
           end
         end
-
-        r[:headers] = headers if headers && !headers.empty?
-        r
       end
+
+      r[:headers] = headers if headers && !headers.empty?
+      r
     end
 
     def build_url(req)
