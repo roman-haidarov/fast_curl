@@ -20,13 +20,16 @@
 #include <strings.h>
 #include <time.h>
 
+void Init_fast_curl(void);
+
 #if defined(__GNUC__) || defined(__clang__)
 #define FAST_CURL_NORETURN __attribute__((noreturn))
 #else
 #define FAST_CURL_NORETURN
 #endif
 
-#define MAX_RESPONSE_SIZE          (100 * 1024 * 1024)
+#define MAX_RESPONSE_SIZE          ((size_t)100 * 1024 * 1024)
+#define MAX_RESPONSE_HEADER_SIZE   ((size_t)1024 * 1024)
 #define MAX_REDIRECTS              5
 #define MAX_TIMEOUT                300
 #define MAX_RETRIES                10
@@ -258,29 +261,63 @@ typedef struct {
 
 typedef struct {
     header_entry_t *entries;
-    int count;
-    int cap;
+    size_t count;
+    size_t cap;
+    size_t total_bytes;
 } header_list_t;
 
 static inline void header_list_init(header_list_t *h) {
     h->entries = NULL;
     h->count = 0;
     h->cap = 0;
+    h->total_bytes = 0;
 }
 
 static void header_list_free(header_list_t *h) {
-    for (int i = 0; i < h->count; i++)
+    for (size_t i = 0; i < h->count; i++)
         free(h->entries[i].str);
     free(h->entries);
     h->entries = NULL;
     h->count = 0;
     h->cap = 0;
+    h->total_bytes = 0;
 }
 
 static void header_list_reset(header_list_t *h) {
-    for (int i = 0; i < h->count; i++)
+    for (size_t i = 0; i < h->count; i++)
         free(h->entries[i].str);
     h->count = 0;
+    h->total_bytes = 0;
+}
+
+static int header_list_add_bytes(header_list_t *h, size_t total) {
+    if (h->total_bytes > MAX_RESPONSE_HEADER_SIZE ||
+        total > MAX_RESPONSE_HEADER_SIZE - h->total_bytes)
+        return 0;
+
+    h->total_bytes += total;
+    return 1;
+}
+
+static int header_list_reserve(header_list_t *h) {
+    if (h->count < h->cap)
+        return 1;
+
+    size_t new_cap = h->cap ? h->cap : INITIAL_HEADER_CAP;
+    if (h->cap && h->cap > SIZE_MAX / 2)
+        return 0;
+    if (h->cap)
+        new_cap = h->cap * 2;
+    if (new_cap > SIZE_MAX / sizeof(*h->entries))
+        return 0;
+
+    header_entry_t *entries = realloc(h->entries, sizeof(*h->entries) * new_cap);
+    if (!entries)
+        return 0;
+
+    h->entries = entries;
+    h->cap = new_cap;
+    return 1;
 }
 
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -294,22 +331,18 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     while (stripped > 0 && (ptr[stripped - 1] == '\r' || ptr[stripped - 1] == '\n'))
         stripped--;
 
-    if (stripped >= 5 && memcmp(ptr, "HTTP/", 5) == 0) {
+    int status_line = stripped >= 5 && memcmp(ptr, "HTTP/", 5) == 0;
+    if (status_line)
         header_list_reset(h);
-        return total;
-    }
 
-    if (stripped == 0)
+    if (!header_list_add_bytes(h, total))
+        return 0;
+
+    if (status_line || stripped == 0)
         return total;
 
-    if (h->count >= h->cap) {
-        int new_cap = (h->cap == 0) ? INITIAL_HEADER_CAP : h->cap * 2;
-        header_entry_t *ne = realloc(h->entries, sizeof(header_entry_t) * new_cap);
-        if (!ne)
-            return 0;
-        h->entries = ne;
-        h->cap = new_cap;
-    }
+    if (!header_list_reserve(h))
+        return 0;
 
     char *entry = malloc(stripped + 1);
     if (!entry)
@@ -415,7 +448,7 @@ typedef struct {
     int still_running;
     long timeout_ms;
     int max_connections;
-    volatile int cancelled;
+    int cancelled;
 
     int active_count;
     int pending_pos;
@@ -423,12 +456,21 @@ typedef struct {
     int *pending_indices;
 } multi_session_t;
 
+static int session_cancelled(const multi_session_t *session) {
+    return __atomic_load_n(&session->cancelled, __ATOMIC_ACQUIRE);
+}
+
+static void cancel_session(multi_session_t *session) {
+    __atomic_store_n(&session->cancelled, 1, __ATOMIC_RELEASE);
+}
+
 typedef struct {
     int max_retries;
     int retries_explicit;
     long retry_delay_ms;
     int *retry_http_codes;
     int retry_http_count;
+    VALUE retry_code_values;
     int retry_non_idempotent;
 } retry_config_t;
 
@@ -571,7 +613,7 @@ static VALUE build_response(request_ctx_t *ctx) {
     curl_easy_getinfo(ctx->easy, CURLINFO_RESPONSE_CODE, &status);
 
     VALUE headers_hash = new_headers_hash();
-    for (int i = 0; i < ctx->headers.count; i++) {
+    for (size_t i = 0; i < ctx->headers.count; i++) {
         const char *hdr = ctx->headers.entries[i].str;
         size_t hdr_len = ctx->headers.entries[i].len;
         const char *colon = memchr(hdr, ':', hdr_len);
@@ -598,7 +640,7 @@ static VALUE build_response(request_ctx_t *ctx) {
     }
 
     VALUE body_str =
-        ctx->body.data ? rb_str_new(ctx->body.data, ctx->body.len) : rb_str_new_cstr("");
+        ctx->body.data ? rb_str_new(ctx->body.data, (long)ctx->body.len) : rb_str_new_cstr("");
 
     VALUE result = rb_hash_new();
     rb_hash_aset(result, SYM(KEY_STATUS), LONG2NUM(status));
@@ -643,7 +685,7 @@ static int is_valid_url(const char *url) {
         return 0;
     if (strncmp(url, "https://", 8) == 0)
         return 1;
-    if (len >= 7 && strncmp(url, "http://", 7) == 0)
+    if (strncmp(url, "http://", 7) == 0)
         return 1;
     return 0;
 }
@@ -886,7 +928,7 @@ static int setup_easy_handle(request_ctx_t *ctx, VALUE request, const request_op
         SET_SETUP_ERROR(ctx, "Missing :url", 0);
         return 0;
     }
-    if (!RB_TYPE_P(url, T_STRING) || memchr(RSTRING_PTR(url), '\0', RSTRING_LEN(url))) {
+    if (!RB_TYPE_P(url, T_STRING) || memchr(RSTRING_PTR(url), '\0', (size_t)RSTRING_LEN(url))) {
         SET_SETUP_ERROR(ctx, "Invalid URL", 1);
         return 0;
     }
@@ -934,6 +976,67 @@ static int setup_easy_handle(request_ctx_t *ctx, VALUE request, const request_op
     return 1;
 }
 
+typedef struct {
+    request_ctx_t request;
+    VALUE value;
+    const request_options_t *options;
+    long index;
+    int fatal;
+    char message[128];
+} request_probe_t;
+
+static VALUE request_probe_body(VALUE arg) {
+    request_probe_t *probe = (request_probe_t *)(uintptr_t)arg;
+    request_ctx_init(&probe->request, probe->index);
+    if (!request_ctx_prepare_easy(&probe->request))
+        return Qnil;
+
+    setup_easy_handle(&probe->request, probe->value, probe->options);
+    probe->fatal = probe->request.setup_error_fatal;
+    if (probe->fatal && probe->request.setup_error)
+        snprintf(probe->message, sizeof(probe->message), "%s (request %ld)",
+                 probe->request.setup_error, probe->index);
+    return Qnil;
+}
+
+static VALUE request_probe_ensure(VALUE arg) {
+    request_probe_t *probe = (request_probe_t *)(uintptr_t)arg;
+    request_ctx_free(&probe->request);
+    return Qnil;
+}
+
+static int validate_request_probe(VALUE request, long index, const request_options_t *options,
+                                  char message[128]) {
+    request_probe_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.value = request;
+    probe.options = options;
+    probe.index = index;
+    rb_ensure(request_probe_body, (VALUE)(uintptr_t)&probe, request_probe_ensure,
+              (VALUE)(uintptr_t)&probe);
+    if (probe.fatal)
+        memcpy(message, probe.message, sizeof(probe.message));
+    RB_GC_GUARD(request);
+    return probe.fatal;
+}
+
+static void validate_execute_requests(VALUE requests, int count, int target, VALUE options,
+                                      const request_options_t *opts) {
+    if (target > 0 && !NIL_P(options)) {
+        VALUE accept = hash_aref_key(options, KEY_ACCEPT);
+        if (!NIL_P(accept) && !rb_respond_to(accept, rb_intern("call")))
+            rb_raise(rb_eArgError, "accept must respond to #call");
+    }
+
+    for (int i = 0; i < count; i++) {
+        char message[128];
+        if (validate_request_probe(rb_ary_entry(requests, i), i, opts, message)) {
+            VALUE klass = NIL_P(fast_validation_error) ? rb_eArgError : fast_validation_error;
+            rb_raise(klass, "%s", message);
+        }
+    }
+}
+
 /* Poll until something actually completes, or the slice budget expires.
    Previously this returned after every single 50ms poll, which under a fiber
    scheduler meant a fresh OS thread twenty times a second. Cancellation still
@@ -943,7 +1046,7 @@ static void *poll_without_gvl(void *arg) {
     long long started = fast_now_ms();
     int before = s->still_running;
 
-    while (!s->cancelled) {
+    while (!session_cancelled(s)) {
         int numfds = 0;
         curl_multi_poll(s->multi, NULL, 0, POLL_TIMEOUT_MS, &numfds);
         curl_multi_perform(s->multi, &s->still_running);
@@ -958,7 +1061,7 @@ static void *poll_without_gvl(void *arg) {
 
 static void unblock_perform(void *arg) {
     multi_session_t *s = (multi_session_t *)arg;
-    s->cancelled = 1;
+    cancel_session(s);
 #ifdef HAVE_CURL_MULTI_WAKEUP
     curl_multi_wakeup(s->multi);
 #endif
@@ -1144,7 +1247,8 @@ static void run_multi_loop(multi_session_t *session, completion_ctx_t *cctx, VAL
     if (process_completed(session, cctx))
         return;
 
-    while (!session->cancelled && (session->active_count > 0 || pending_remaining(session))) {
+    while (!session_cancelled(session) &&
+           (session->active_count > 0 || pending_remaining(session))) {
         if (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms)
             break;
 
@@ -1229,6 +1333,7 @@ static void retry_config_init(retry_config_t *retry_cfg) {
     retry_cfg->retry_delay_ms = DEFAULT_RETRY_DELAY;
     retry_cfg->retry_http_codes = NULL;
     retry_cfg->retry_http_count = 0;
+    retry_cfg->retry_code_values = Qnil;
     retry_cfg->retry_non_idempotent = 0;
 }
 
@@ -1287,22 +1392,33 @@ static void parse_retry_codes(VALUE options, retry_config_t *retry_cfg) {
         rb_raise(rb_eArgError, "retry_codes is too large");
 
     len = (int)len_long;
+    VALUE normalized = rb_ary_new_capa(len);
     for (int i = 0; i < len; i++) {
         int code = NUM2INT(rb_ary_entry(codes, i));
         if (code < 100 || code > 599)
             rb_raise(rb_eArgError, "retry_codes must contain valid HTTP status codes");
+        rb_ary_push(normalized, INT2NUM(code));
     }
 
-    if (len == 0)
+    retry_cfg->retry_code_values = normalized;
+    retry_cfg->retry_http_count = len;
+    RB_GC_GUARD(codes);
+}
+
+static void materialize_retry_codes(retry_config_t *retry_cfg) {
+    if (retry_cfg->retry_http_count == 0)
         return;
 
-    retry_cfg->retry_http_codes = malloc(sizeof(int) * (size_t)len);
+    size_t count = (size_t)retry_cfg->retry_http_count;
+    if (count > SIZE_MAX / sizeof(*retry_cfg->retry_http_codes))
+        rb_raise(rb_eArgError, "retry_codes is too large");
+
+    retry_cfg->retry_http_codes = malloc(sizeof(*retry_cfg->retry_http_codes) * count);
     if (!retry_cfg->retry_http_codes)
         rb_raise(rb_eNoMemError, "failed to allocate retry codes");
 
-    retry_cfg->retry_http_count = len;
-    for (int i = 0; i < len; i++)
-        retry_cfg->retry_http_codes[i] = NUM2INT(rb_ary_entry(codes, i));
+    for (int i = 0; i < retry_cfg->retry_http_count; i++)
+        retry_cfg->retry_http_codes[i] = NUM2INT(rb_ary_entry(retry_cfg->retry_code_values, i));
 }
 
 static void parse_options(VALUE options, request_options_t *opts, int *max_conn,
@@ -1347,7 +1463,17 @@ static void parse_options(VALUE options, request_options_t *opts, int *max_conn,
     retry_cfg->retry_delay_ms =
         parse_long_option(options, KEY_RETRY_DELAY, "retry_delay", 0, MAX_RETRY_DELAY_MS,
                           retry_cfg->retry_delay_ms, NULL);
-    parse_retry_codes(options, retry_cfg);
+}
+
+static void configure_retry_mode(retry_config_t *retry_cfg, int target, int stream) {
+    if (!stream && target <= 0)
+        return;
+
+    if (retry_cfg->retries_explicit && retry_cfg->max_retries > 0 && stream)
+        rb_warn("FastCurl: retries are not supported in stream_execute, ignoring retries option");
+    if (retry_cfg->retries_explicit && retry_cfg->max_retries > 0 && target > 0)
+        rb_warn("FastCurl: retries are not supported in first_execute, ignoring retries option");
+    retry_cfg->max_retries = 0;
 }
 
 static void multi_session_init(multi_session_t *session, CURLM *multi, int count, int max_conn,
@@ -1410,6 +1536,27 @@ static FAST_CURL_NORETURN void cleanup_and_raise(cleanup_ctx_t *cleanup, VALUE e
     rb_raise(exception, "%s", message);
 }
 
+static void prepare_execute_session(multi_session_t *session, int **invalid, cleanup_ctx_t *cleanup,
+                                    retry_config_t *retry_cfg, int count, int max_conn,
+                                    long timeout_sec) {
+    multi_session_init(session, curl_multi_init(), count, max_conn, timeout_sec);
+    cleanup->session = session;
+    cleanup->invalid = NULL;
+    cleanup->retry_cfg = retry_cfg;
+    if (!session->multi)
+        cleanup_and_raise(cleanup, rb_eNoMemError, "failed to initialize curl multi handle");
+
+    multi_session_configure(session->multi, max_conn);
+    session->requests = calloc((size_t)count, sizeof(*session->requests));
+    if (!session->requests)
+        cleanup_and_raise(cleanup, rb_eNoMemError, "failed to allocate request contexts");
+
+    *invalid = calloc((size_t)count, sizeof(**invalid));
+    cleanup->invalid = *invalid;
+    if (!*invalid)
+        cleanup_and_raise(cleanup, rb_eNoMemError, "failed to allocate tracking array");
+}
+
 typedef struct {
     VALUE requests;
     VALUE options;
@@ -1421,130 +1568,144 @@ typedef struct {
     request_options_t *opts;
 } execute_args_t;
 
+static void completion_context_init(completion_ctx_t *cctx, const execute_args_t *ea, int count) {
+    cctx->results =
+        ea->stream ? Qnil : (ea->target > 0 ? rb_ary_new2(ea->target) : rb_ary_new2(count));
+    cctx->accept =
+        ea->target > 0 && !NIL_P(ea->options) ? hash_aref_key(ea->options, KEY_ACCEPT) : Qnil;
+    cctx->completed = 0;
+    cctx->target = ea->target;
+    cctx->stream = ea->stream;
+
+    if (!NIL_P(cctx->accept) && !rb_respond_to(cctx->accept, rb_intern("call")))
+        rb_raise(rb_eArgError, "accept must respond to #call");
+
+    if (!ea->stream && ea->target <= 0) {
+        for (int i = 0; i < count; i++)
+            rb_ary_store(cctx->results, i, Qnil);
+    }
+}
+
+static int retry_one_attempt(execute_args_t *ea, completion_ctx_t *cctx, int *deadline_hit,
+                             int attempt) {
+    multi_session_t *session = ea->session;
+    int count = session->count;
+    request_options_t *opts = ea->opts;
+    retry_config_t *retry_cfg = ea->retry_cfg;
+
+    if (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms) {
+        *deadline_hit = 1;
+        return 0;
+    }
+
+    int *retry_indices = ALLOCA_N(int, count);
+    int retry_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (!ea->invalid[i] && session->requests[i].done &&
+            should_retry(&session->requests[i], retry_cfg))
+            retry_indices[retry_count++] = i;
+    }
+
+    if (retry_count == 0)
+        return 0;
+
+    long backoff = retry_backoff_ms(retry_cfg, attempt);
+    if (opts->deadline_ms > 0) {
+        long long left = opts->deadline_ms - fast_now_ms();
+        if (left <= 0) {
+            *deadline_hit = 1;
+            return 0;
+        }
+        if (backoff > (long)left)
+            backoff = (long)left;
+    }
+    retry_delay_sleep(backoff);
+
+    int runnable_count = 0;
+    for (int r = 0; r < retry_count; r++) {
+        int idx = retry_indices[r];
+        request_ctx_t *request = &session->requests[idx];
+        if (!request_ctx_reset_for_retry(request)) {
+            ea->invalid[idx] = 1;
+            request->done = 1;
+            request->setup_error = "Failed to allocate a curl handle for the retry";
+            continue;
+        }
+
+        retry_indices[runnable_count++] = idx;
+    }
+
+    if (runnable_count > 0) {
+        cctx->completed = 0;
+        run_multi_loop(session, cctx, ea->requests, ea->invalid, opts, retry_indices,
+                       runnable_count);
+    }
+    return 1;
+}
+
+static int retry_completed_requests(execute_args_t *ea, completion_ctx_t *cctx) {
+    int deadline_hit = 0;
+    for (int attempt = 0; attempt < ea->retry_cfg->max_retries; attempt++) {
+        if (!retry_one_attempt(ea, cctx, &deadline_hit, attempt))
+            break;
+    }
+    return deadline_hit;
+}
+
+static void store_execution_results(execute_args_t *ea, completion_ctx_t *cctx, int deadline_hit) {
+    multi_session_t *session = ea->session;
+    request_options_t *opts = ea->opts;
+    for (int i = 0; i < session->count; i++) {
+        request_ctx_t *request = &session->requests[i];
+        VALUE response;
+
+        if (ea->invalid[i]) {
+            response = build_error_response(request->setup_error ? request->setup_error
+                                                                 : "Invalid request configuration",
+                                            ERR_INVALID_REQUEST, request->attempts);
+        } else if (!request->done) {
+            response = deadline_hit || (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms)
+                           ? build_error_response("Total timeout exceeded", ERR_DEADLINE,
+                                                  request->attempts)
+                           : build_error_response("Request was not completed", ERR_NOT_COMPLETED,
+                                                  request->attempts);
+        } else if (request->curl_result == CURLE_OK) {
+            response = build_response(request);
+        } else {
+            response = build_error_response_with_code(curl_easy_strerror(request->curl_result),
+                                                      (int)request->curl_result, request->attempts);
+        }
+
+        rb_ary_store(cctx->results, i, build_result_pair(i, response));
+    }
+}
+
 static VALUE internal_execute_body(VALUE arg) {
     execute_args_t *ea = (execute_args_t *)arg;
-    VALUE requests = ea->requests;
     multi_session_t *session = ea->session;
-    int *invalid = ea->invalid;
     retry_config_t *retry_cfg = ea->retry_cfg;
     request_options_t *opts = ea->opts;
-    int deadline_hit = 0;
     int count = session->count;
-    int target = ea->target;
-    int stream = ea->stream;
 
     for (int i = 0; i < count; i++)
         request_ctx_init(&session->requests[i], i);
 
     completion_ctx_t cctx;
-    cctx.results = stream ? Qnil : ((target > 0) ? rb_ary_new2(target) : rb_ary_new2(count));
-    cctx.accept = target > 0 && !NIL_P(ea->options) ? hash_aref_key(ea->options, KEY_ACCEPT) : Qnil;
-    cctx.completed = 0;
-    cctx.target = target;
-    cctx.stream = stream;
-
-    if (!NIL_P(cctx.accept) && !rb_respond_to(cctx.accept, rb_intern("call")))
-        rb_raise(rb_eArgError, "accept must respond to #call");
-
-    if (!stream && target <= 0) {
-        for (int i = 0; i < count; i++)
-            rb_ary_store(cctx.results, i, Qnil);
-    }
+    completion_context_init(&cctx, ea, count);
 
     if (opts->total_timeout_ms > 0)
         opts->deadline_ms = fast_now_ms() + opts->total_timeout_ms;
 
-    run_multi_loop(session, &cctx, requests, invalid, opts, NULL, count);
+    run_multi_loop(session, &cctx, ea->requests, ea->invalid, opts, NULL, count);
 
-    if (!stream && target <= 0 && retry_cfg->max_retries > 0) {
-        for (int attempt = 0; attempt < retry_cfg->max_retries; attempt++) {
-            if (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms) {
-                deadline_hit = 1;
-                break;
-            }
+    int deadline_hit = 0;
+    if (!ea->stream && ea->target <= 0 && retry_cfg->max_retries > 0)
+        deadline_hit = retry_completed_requests(ea, &cctx);
 
-            int *retry_indices = malloc(sizeof(int) * (size_t)count);
-            if (!retry_indices)
-                rb_raise(rb_eNoMemError, "failed to allocate retry index array");
+    if (!ea->stream && ea->target <= 0)
+        store_execution_results(ea, &cctx, deadline_hit);
 
-            int retry_count = 0;
-            for (int i = 0; i < count; i++) {
-                if (invalid[i] || !session->requests[i].done)
-                    continue;
-                if (should_retry(&session->requests[i], retry_cfg))
-                    retry_indices[retry_count++] = i;
-            }
-
-            if (retry_count == 0) {
-                free(retry_indices);
-                break;
-            }
-
-            long backoff = retry_backoff_ms(retry_cfg, attempt);
-            if (opts->deadline_ms > 0) {
-                long long left = opts->deadline_ms - fast_now_ms();
-                if (left <= 0) {
-                    deadline_hit = 1;
-                    free(retry_indices);
-                    break;
-                }
-                if (backoff > (long)left)
-                    backoff = (long)left;
-            }
-            retry_delay_sleep(backoff);
-
-            int runnable_count = 0;
-            for (int r = 0; r < retry_count; r++) {
-                int idx = retry_indices[r];
-                request_ctx_t *rc = &session->requests[idx];
-
-                if (!request_ctx_reset_for_retry(rc)) {
-                    invalid[idx] = 1;
-                    rc->done = 1;
-                    rc->setup_error = "Failed to allocate a curl handle for the retry";
-                    continue;
-                }
-
-                retry_indices[runnable_count++] = idx;
-            }
-
-            if (runnable_count > 0) {
-                cctx.completed = 0;
-                run_multi_loop(session, &cctx, requests, invalid, opts, retry_indices,
-                               runnable_count);
-            }
-
-            free(retry_indices);
-        }
-    }
-
-    if (!stream && target <= 0) {
-        for (int i = 0; i < count; i++) {
-            request_ctx_t *rc = &session->requests[i];
-            VALUE response;
-
-            if (invalid[i]) {
-                response = build_error_response(rc->setup_error ? rc->setup_error
-                                                                : "Invalid request configuration",
-                                                ERR_INVALID_REQUEST, rc->attempts);
-            } else if (!rc->done) {
-                response =
-                    deadline_hit || (opts->deadline_ms > 0 && fast_now_ms() >= opts->deadline_ms)
-                        ? build_error_response("Total timeout exceeded", ERR_DEADLINE, rc->attempts)
-                        : build_error_response("Request was not completed", ERR_NOT_COMPLETED,
-                                               rc->attempts);
-            } else if (rc->curl_result == CURLE_OK) {
-                response = build_response(rc);
-            } else {
-                response = build_error_response_with_code(curl_easy_strerror(rc->curl_result),
-                                                          (int)rc->curl_result, rc->attempts);
-            }
-
-            rb_ary_store(cctx.results, i, build_result_pair(i, response));
-        }
-    }
-
-    return stream ? Qnil : cctx.results;
+    return ea->stream ? Qnil : cctx.results;
 }
 
 typedef enum {
@@ -1777,7 +1938,7 @@ static void *lazy_poll_without_gvl(void *arg) {
     long long started = fast_now_ms();
     int before = session->still_running;
 
-    while (!session->cancelled) {
+    while (!session_cancelled(session)) {
         int numfds = 0;
         curl_multi_poll(session->multi, NULL, 0, POLL_TIMEOUT_MS, &numfds);
         curl_multi_perform(session->multi, &session->still_running);
@@ -1962,6 +2123,49 @@ static VALUE cleanup_lazy_execute(VALUE arg) {
     return Qnil;
 }
 
+static void initialize_lazy_completion(lazy_execute_ctx_t *ctx, VALUE requests, VALUE options,
+                                       int target, int stream, int max_conn) {
+    ctx->capacity = max_conn + ctx->buffer_size;
+    ctx->source = requests;
+    ctx->anchors = rb_ary_new2(ctx->capacity);
+    ctx->next_index = 0;
+
+    ctx->cctx.results = stream ? Qnil : rb_ary_new();
+    ctx->cctx.accept = target > 0 && !NIL_P(options) ? hash_aref_key(options, KEY_ACCEPT) : Qnil;
+    ctx->cctx.completed = 0;
+    ctx->cctx.target = target;
+    ctx->cctx.stream = stream;
+
+    if (!NIL_P(ctx->cctx.accept) && !rb_respond_to(ctx->cctx.accept, rb_intern("call")))
+        rb_raise(rb_eArgError, "accept must respond to #call");
+}
+
+static void allocate_lazy_state(lazy_execute_ctx_t *ctx, int max_conn) {
+    materialize_retry_codes(&ctx->retry_cfg);
+    multi_session_init(&ctx->session, curl_multi_init(), ctx->capacity, max_conn,
+                       ctx->opts.timeout_sec);
+    if (!ctx->session.multi) {
+        cleanup_lazy_execute((VALUE)ctx);
+        rb_raise(rb_eNoMemError, "failed to initialize curl multi handle");
+    }
+    multi_session_configure(ctx->session.multi, max_conn);
+
+    ctx->session.requests = calloc((size_t)ctx->capacity, sizeof(*ctx->session.requests));
+    ctx->states = calloc((size_t)ctx->capacity, sizeof(*ctx->states));
+    ctx->free_slots = malloc(sizeof(*ctx->free_slots) * (size_t)ctx->capacity);
+    ctx->pending_slots = malloc(sizeof(*ctx->pending_slots) * (size_t)ctx->capacity);
+    ctx->retry_at_ms = calloc((size_t)ctx->capacity, sizeof(*ctx->retry_at_ms));
+
+    if (!ctx->session.requests || !ctx->states || !ctx->free_slots || !ctx->pending_slots ||
+        !ctx->retry_at_ms) {
+        cleanup_lazy_execute((VALUE)ctx);
+        rb_raise(rb_eNoMemError, "failed to allocate lazy request state");
+    }
+
+    for (int slot = 0; slot < ctx->capacity; slot++)
+        ctx->free_slots[ctx->free_count++] = slot;
+}
+
 static VALUE internal_lazy_execute(VALUE requests, VALUE options, int target, int stream) {
     if (!rb_respond_to(requests, rb_intern("each")))
         rb_raise(rb_eArgError, "requests must be an Array or respond to #each");
@@ -1971,54 +2175,14 @@ static VALUE internal_lazy_execute(VALUE requests, VALUE options, int target, in
 
     int max_conn;
     parse_options(options, &ctx.opts, &max_conn, &ctx.retry_cfg);
+    parse_retry_codes(options, &ctx.retry_cfg);
     ctx.buffer_size = NIL_P(options) ? max_conn
                                      : parse_int_option(options, KEY_BUFFER, "buffer", 1,
                                                         MAX_BUFFER, max_conn, NULL);
 
-    if (stream || target > 0) {
-        if (ctx.retry_cfg.retries_explicit && ctx.retry_cfg.max_retries > 0 && stream)
-            rb_warn(
-                "FastCurl: retries are not supported in stream_execute, ignoring retries option");
-        if (ctx.retry_cfg.retries_explicit && ctx.retry_cfg.max_retries > 0 && target > 0)
-            rb_warn(
-                "FastCurl: retries are not supported in first_execute, ignoring retries option");
-        ctx.retry_cfg.max_retries = 0;
-    }
-
-    ctx.capacity = max_conn + ctx.buffer_size;
-    ctx.source = requests;
-    ctx.anchors = rb_ary_new2(ctx.capacity);
-    ctx.next_index = 0;
-
-    ctx.cctx.results = stream ? Qnil : rb_ary_new();
-    ctx.cctx.accept = target > 0 && !NIL_P(options) ? hash_aref_key(options, KEY_ACCEPT) : Qnil;
-    ctx.cctx.completed = 0;
-    ctx.cctx.target = target;
-    ctx.cctx.stream = stream;
-
-    if (!NIL_P(ctx.cctx.accept) && !rb_respond_to(ctx.cctx.accept, rb_intern("call")))
-        rb_raise(rb_eArgError, "accept must respond to #call");
-
-    multi_session_init(&ctx.session, curl_multi_init(), ctx.capacity, max_conn,
-                       ctx.opts.timeout_sec);
-    if (!ctx.session.multi)
-        rb_raise(rb_eNoMemError, "failed to initialize curl multi handle");
-    multi_session_configure(ctx.session.multi, max_conn);
-
-    ctx.session.requests = calloc((size_t)ctx.capacity, sizeof(request_ctx_t));
-    ctx.states = calloc((size_t)ctx.capacity, sizeof(int));
-    ctx.free_slots = malloc(sizeof(int) * (size_t)ctx.capacity);
-    ctx.pending_slots = malloc(sizeof(int) * (size_t)ctx.capacity);
-    ctx.retry_at_ms = calloc((size_t)ctx.capacity, sizeof(long long));
-
-    if (!ctx.session.requests || !ctx.states || !ctx.free_slots || !ctx.pending_slots ||
-        !ctx.retry_at_ms) {
-        cleanup_lazy_execute((VALUE)&ctx);
-        rb_raise(rb_eNoMemError, "failed to allocate lazy request state");
-    }
-
-    for (int slot = 0; slot < ctx.capacity; slot++)
-        ctx.free_slots[ctx.free_count++] = slot;
+    configure_retry_mode(&ctx.retry_cfg, target, stream);
+    initialize_lazy_completion(&ctx, requests, options, target, stream, max_conn);
+    allocate_lazy_state(&ctx, max_conn);
 
     return rb_ensure(lazy_execute_body, (VALUE)&ctx, cleanup_lazy_execute, (VALUE)&ctx);
 }
@@ -2053,7 +2217,7 @@ static VALUE scheduler_execute_thread(void *arg) {
 static void cancel_scheduler_execute(scheduler_execute_ctx_t *ctx) {
     multi_session_t *session = ctx->ea->session;
 
-    session->cancelled = 1;
+    cancel_session(session);
 #ifdef HAVE_CURL_MULTI_WAKEUP
     if (session->multi)
         curl_multi_wakeup(session->multi);
@@ -2120,63 +2284,17 @@ static VALUE internal_execute(VALUE requests, VALUE options, int target, int str
     int max_conn;
     retry_config_t retry_cfg;
     parse_options(options, &opts, &max_conn, &retry_cfg);
+    parse_retry_codes(options, &retry_cfg);
 
-    if (target > 0 && !NIL_P(options)) {
-        VALUE accept = hash_aref_key(options, KEY_ACCEPT);
-        if (!NIL_P(accept) && !rb_respond_to(accept, rb_intern("call")))
-            rb_raise(rb_eArgError, "accept must respond to #call");
-    }
+    validate_execute_requests(requests, count, target, options, &opts);
+    configure_retry_mode(&retry_cfg, target, stream);
 
-    for (int i = 0; i < count; i++) {
-        request_ctx_t probe;
-        request_ctx_init(&probe, i);
-        if (!request_ctx_prepare_easy(&probe)) {
-            request_ctx_free(&probe);
-            continue;
-        }
-        setup_easy_handle(&probe, rb_ary_entry(requests, i), &opts);
-        int fatal = probe.setup_error_fatal;
-        const char *message = probe.setup_error;
-        char buffer[128];
-        if (fatal && message) {
-            snprintf(buffer, sizeof(buffer), "%s (request %d)", message, i);
-        }
-        request_ctx_free(&probe);
-        if (fatal) {
-            VALUE klass = NIL_P(fast_validation_error) ? rb_eArgError : fast_validation_error;
-            rb_raise(klass, "%s", buffer);
-        }
-    }
-
-    if (stream || target > 0) {
-        if (retry_cfg.retries_explicit && retry_cfg.max_retries > 0 && stream)
-            rb_warn(
-                "FastCurl: retries are not supported in stream_execute, ignoring retries option");
-        if (retry_cfg.retries_explicit && retry_cfg.max_retries > 0 && target > 0)
-            rb_warn(
-                "FastCurl: retries are not supported in first_execute, ignoring retries option");
-        retry_cfg.max_retries = 0;
-    }
-
+    materialize_retry_codes(&retry_cfg);
     multi_session_t session;
     int *invalid = NULL;
-    multi_session_init(&session, curl_multi_init(), count, max_conn, opts.timeout_sec);
-
-    cleanup_ctx_t cleanup = {.session = &session, .invalid = NULL, .retry_cfg = &retry_cfg};
-
-    if (!session.multi)
-        cleanup_and_raise(&cleanup, rb_eNoMemError, "failed to initialize curl multi handle");
-
-    multi_session_configure(session.multi, max_conn);
-
-    session.requests = calloc((size_t)count, sizeof(request_ctx_t));
-    if (!session.requests)
-        cleanup_and_raise(&cleanup, rb_eNoMemError, "failed to allocate request contexts");
-
-    invalid = calloc((size_t)count, sizeof(int));
-    cleanup.invalid = invalid;
-    if (!invalid)
-        cleanup_and_raise(&cleanup, rb_eNoMemError, "failed to allocate tracking array");
+    cleanup_ctx_t cleanup = {0};
+    prepare_execute_session(&session, &invalid, &cleanup, &retry_cfg, count, max_conn,
+                            opts.timeout_sec);
     execute_args_t ea = {
         .requests = requests,
         .options = options,

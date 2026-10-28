@@ -278,27 +278,27 @@ grows linearly while parallel clients stay near ~1s plus network overhead.
 
 | Scenario                        | Net::HTTP sequential | fast_curl (thread) | fast_curl (fiber/Async) | Async::HTTP::Internet |
 |---------------------------------|---------------------:|-------------------:|------------------------:|----------------------:|
-| 4 requests × 1s, conn=4         |                8.27s |              2.36s |                   2.13s |                 2.56s |
-| 10 requests × 1s, conn=10       |               20.92s |              3.49s |                   5.23s |                 3.83s |
-| 20 requests × 1s, conn=5        |               42.56s |              2.94s |                   2.90s |                12.14s |
-| 200 requests × 1s, conn=20      |                   —  |             22.19s |                  21.77s |                23.59s |
+| 4 requests × 1s, conn=4         |                5.82s |              1.68s |                   1.65s |                 1.93s |
+| 10 requests × 1s, conn=10       |               17.51s |              1.70s |                   1.68s |                 1.89s |
+| 20 requests × 1s, conn=5        |               34.66s |              5.69s |                   6.71s |                 5.79s |
+| 200 requests × 1s, conn=20      |                   —  |             14.29s |                  14.29s |                 7.27s |
 
 ### Speedup vs Net::HTTP (median)
 
 | Scenario                          | fast_curl (thread) | fast_curl (fiber) | Async::HTTP |
 |-----------------------------------|-------------------:|------------------:|------------:|
-| 4 requests × 1s                   |           **3.5x** |              3.9x |        3.2x |
-| 10 requests × 1s                  |           **6.0x** |              4.0x |        5.5x |
-| 20 requests × 1s (queued, conn=5) |          **14.5x** |             14.7x |        3.5x |
+| 4 requests × 1s                   |           **3.5x** |              3.5x |        3.0x |
+| 10 requests × 1s                  |          **10.3x** |             10.4x |        9.2x |
+| 20 requests × 1s (queued, conn=5) |           **6.1x** |              5.2x |        6.0x |
 
 ### Memory & allocations per request batch (lower is better)
 
 | Scenario                        | fast_curl (thread) allocated | fast_curl (fiber) allocated | Async::HTTP allocated |
 |---------------------------------|-----------------------------:|----------------------------:|----------------------:|
-| 4 requests × 1s                 |                 **278 obj**  |                     350 obj |             2,433 obj |
-| 10 requests × 1s                |                 **490 obj**  |                     756 obj |             4,763 obj |
-| 20 requests × 1s, conn=5        |                 **621 obj**  |                     750 obj |             8,536 obj |
-| 200 requests × 1s, conn=20      |               **5,188 obj**  |                   5,642 obj |            78,203 obj |
+| 4 requests × 1s                 |                 **125 obj**  |                     179 obj |             1,921 obj |
+| 10 requests × 1s                |                 **281 obj**  |                     335 obj |             3,344 obj |
+| 20 requests × 1s, conn=5        |                 **541 obj**  |                     595 obj |             5,898 obj |
+| 200 requests × 1s, conn=20      |               **5,222 obj**  |                   5,275 obj |            50,534 obj |
 
 Ruby heap delta stays near zero across all scenarios for fast_curl — most allocation
 happens in C, not on the Ruby heap.
@@ -307,7 +307,7 @@ happens in C, not on the Ruby heap.
 
 | Scenario                                                     |  Time |
 |--------------------------------------------------------------|------:|
-| 4 mixed requests (404, 500, DNS fail, 30s delay), timeout=2s | 4.02s |
+| 4 mixed requests (404, 500, DNS fail, 30s delay), timeout=2s | 0.68s |
 
 Bounded by `timeout=2s` rather than by the slow request.
 

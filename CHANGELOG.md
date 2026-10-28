@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-28
+
+### Fixed
+
+- Made cancellation state atomic so thread and Fiber-scheduler cancellation do
+  not race with the native polling loops.
+- Bound accumulated response headers to 1 MiB and use overflow-safe header
+  storage sizing.
+- Ensure request-validation probe resources are released if Ruby raises while
+  preparing a request.
+- Defer native retry-code allocation until option validation has completed.
+
 ## [0.5.0] - 2026-09-13
 
 ### Added
